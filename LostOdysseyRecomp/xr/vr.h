@@ -26,9 +26,10 @@ enum class Mode : uint32_t
     Off = 0,
     Theater = 1,  // finished frame on a quad in front of the player
     Mono = 2,     // one head-tracked view, the same image to both eyes (stepping stone to stereo)
+    Stereo = 3,   // two FSceneViews per frame (left/right halves), each with its eye's pose and frustum
 };
 
-// Requested at startup (LO_VR=theater|mono); fixed for the run.
+// Requested at startup (LO_VR=theater|mono|stereo); fixed for the run.
 Mode RequestedMode();
 
 // Opens the loader, creates the OpenXR instance and finds the headset. Safe to
@@ -57,6 +58,11 @@ void SubmitDesktopFrame(plume::RenderTexture* image, uint32_t width, uint32_t he
 // the headset field of view to the main camera. Returns true when it changed
 // the view (the caller then skips its own projection edits).
 bool AdjustMainView(uint32_t view);
+
+// Stereo: CalcSceneView is being run once per eye this frame.
+bool StereoViewsActive();
+// Eye whose FSceneView is being built on this thread (0 left, 1 right, -1 none).
+void SetCurrentEye(int eye);
 
 // Session is running and frames are being submitted.
 bool Active();

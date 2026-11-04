@@ -31,6 +31,7 @@ Mode RequestedMode()
         const std::string_view text(value);
         if (text == "theater" || text == "1") return Mode::Theater;
         if (text == "mono" || text == "2") return Mode::Mono;
+        if (text == "stereo" || text == "3") return Mode::Stereo;
         LOG_WARNING("vr: unknown LO_VR value '{}'; VR stays off", text);
         return Mode::Off;
     }();
@@ -44,6 +45,8 @@ std::string PreferredDeviceName() { return {}; }
 void OnDeviceCreated(plume::RenderDevice*, plume::RenderCommandQueue*) {}
 void SubmitDesktopFrame(plume::RenderTexture*, uint32_t, uint32_t, std::vector<plume::RenderCommandSemaphore*>&) {}
 bool AdjustMainView(uint32_t) { return false; }
+bool StereoViewsActive() { return false; }
+void SetCurrentEye(int) {}
 bool Active() { return false; }
 void Shutdown() {}
 #else
@@ -151,7 +154,8 @@ struct Tangents { float left = -1, right = 1, up = 1, down = -1; };
 
 struct HeadPose
 {
-    XrPosef pose{{0, 0, 0, 1}, {0, 0, 0}};
+    XrPosef pose{{0, 0, 0, 1}, {0, 0, 0}};   // head (centre between the eyes)
+    XrPosef eyePose[2]{{{0, 0, 0, 1}, {0, 0, 0}}, {{0, 0, 0, 1}, {0, 0, 0}}};
     Tangents eye[2];
     bool valid = false;
 };
@@ -160,6 +164,7 @@ std::mutex g_poseMutex;
 HeadPose g_latest;     // newest prediction from the present thread
 HeadPose g_rendered;   // what the game thread last rendered the main view with
 uint64_t g_adjustedViews = 0;
+thread_local int t_eye = -1;
 
 // Mono renders one 16:9 image (the guest's 1280x720 shape) for both eyes. Its
 // frustum is the union of both eyes, widened to 16:9 so it covers them fully.
@@ -223,6 +228,27 @@ Mat4 Multiply(const Mat4& a, const Mat4& b)
 // (x right, y up, z forward); OpenXR's is right-handed (z back), so z flips.
 // A point c in the game camera's space moves to R^T (c - p) in head space;
 // with row vectors that is (c - p) * R, R being the column-convention rotation.
+// The headset owns pitch and roll: keep the game camera's position and heading
+// but level it, so turning the head never tilts the horizon. UE3 world space is
+// Z up; the view's columns are the camera right/up/forward axes in world space.
+Mat4 LevelView(const Mat4& v)
+{
+    const float fx = v[0 * 4 + 2], fy = v[1 * 4 + 2];
+    const float length = std::sqrt(fx * fx + fy * fy);
+    if (length < 1e-4f) return v;  // looking straight up or down: keep the game's view
+    const float f[3] = {fx / length, fy / length, 0.0f};
+    const float r[3] = {-f[1], f[0], 0.0f};
+    const float u[3] = {0.0f, 0.0f, 1.0f};
+    // World camera position: row3 = -pos * M3, M3 orthonormal.
+    float pos[3];
+    for (int i = 0; i < 3; ++i) pos[i] = -(v[12] * v[i * 4 + 0] + v[13] * v[i * 4 + 1] + v[14] * v[i * 4 + 2]);
+    Mat4 out{};
+    for (int i = 0; i < 3; ++i) { out[i * 4 + 0] = r[i]; out[i * 4 + 1] = u[i]; out[i * 4 + 2] = f[i]; }
+    for (int j = 0; j < 3; ++j) out[12 + j] = -(pos[0] * out[0 * 4 + j] + pos[1] * out[1 * 4 + j] + pos[2] * out[2 * 4 + j]);
+    out[15] = 1.0f;
+    return out;
+}
+
 Mat4 HeadCorrection(const XrPosef& pose, float unitsPerMetre)
 {
     const float x = pose.orientation.x, y = pose.orientation.y, z = pose.orientation.z, w = pose.orientation.w;
@@ -429,7 +455,7 @@ bool Initialize()
         return false;
     LOG_NOTICE("vr: OpenXR runtime '{}' {}.{}.{}, system '{}', mode {}", properties.runtimeName,
         XR_VERSION_MAJOR(properties.runtimeVersion), XR_VERSION_MINOR(properties.runtimeVersion),
-        XR_VERSION_PATCH(properties.runtimeVersion), s.systemName, RequestedMode() == Mode::Mono ? "mono" : "theater");
+        XR_VERSION_PATCH(properties.runtimeVersion), s.systemName, RequestedMode() == Mode::Stereo ? "stereo" : RequestedMode() == Mode::Mono ? "mono" : "theater");
     s.initialized = true;
     s.initFailed = false;
     return true;
@@ -494,7 +520,10 @@ void OnDeviceCreated(plume::RenderDevice* device, plume::RenderCommandQueue* que
 
 bool AdjustMainView(uint32_t view)
 {
-    if (RequestedMode() != Mode::Mono || !s.running || !g_memory.base) return false;
+    const Mode mode = RequestedMode();
+    const int eye = t_eye;
+    if (!s.running || !g_memory.base) return false;
+    if (mode != Mode::Mono && !(mode == Mode::Stereo && eye >= 0)) return false;
     HeadPose head;
     {
         const std::scoped_lock lock(g_poseMutex);
@@ -510,23 +539,36 @@ bool AdjustMainView(uint32_t view)
             viewMatrix[12], viewMatrix[13], viewMatrix[14], viewMatrix[15], projection[0], projection[5],
             projection[8], projection[9], projection[10], projection[11], projection[12], projection[13], projection[14], projection[15]);
     }
-    const Mat4 adjusted = Multiply(viewMatrix, HeadCorrection(head.pose, WorldScale()));
+    static const bool keepPitch = [] { const char* v = getenv("LO_VR_KEEP_PITCH"); return v && v[0] == '1'; }();
+    if (!keepPitch) viewMatrix = LevelView(viewMatrix);
+    const XrPosef& pose = eye >= 0 ? head.eyePose[eye] : head.pose;
+    const Mat4 adjusted = Multiply(viewMatrix, HeadCorrection(pose, WorldScale()));
     for (uint32_t i = 0; i < 16; ++i) StoreGuestFloat(view + 0x40 + i * 4, adjusted[i]);
 
     // Projection: keep the game's depth terms (column 2/3), replace the x/y scale
     // and centre with the headset frustum (off-axis allowed).
-    const Tangents t = MonoTangents(head);
+    const Tangents t = eye >= 0 ? head.eye[eye] : MonoTangents(head);
     StoreGuestFloat(view + 0x80 + 0 * 4, 2.0f / (t.right - t.left));
     StoreGuestFloat(view + 0x80 + 5 * 4, 2.0f / (t.up - t.down));
     StoreGuestFloat(view + 0x80 + 8 * 4, -(t.right + t.left) / (t.right - t.left));
     StoreGuestFloat(view + 0x80 + 9 * 4, -(t.up + t.down) / (t.up - t.down));
     {
+        // The left eye's view is built first; the frame is complete once the last view of it is.
         const std::scoped_lock lock(g_poseMutex);
         g_rendered = head;
     }
     ++g_adjustedViews;
     return true;
 }
+
+bool StereoViewsActive()
+{
+    if (RequestedMode() != Mode::Stereo || !s.running) return false;
+    const std::scoped_lock lock(g_poseMutex);
+    return g_latest.valid;
+}
+
+void SetCurrentEye(int eye) { t_eye = eye; }
 
 bool Active() { return s.running; }
 
@@ -544,7 +586,7 @@ void SubmitDesktopFrame(plume::RenderTexture* image, uint32_t width, uint32_t he
     XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
     if (!Check(x.xrBeginFrame(s.session, &beginInfo), "xrBeginFrame")) return;
 
-    if (RequestedMode() == Mode::Mono) {
+    if (RequestedMode() == Mode::Mono || RequestedMode() == Mode::Stereo) {
         XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
         locate.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
         // The game thread renders about a frame ahead of this present.
@@ -575,6 +617,10 @@ void SubmitDesktopFrame(plume::RenderTexture* image, uint32_t width, uint32_t he
                                          y.w * q.y - y.x * q.z + y.y * q.w + y.z * q.x,
                                          y.w * q.z + y.x * q.y - y.y * q.x + y.z * q.w,
                                          y.w * q.w - y.x * q.x - y.y * q.y - y.z * q.z};
+            }
+            for (int e = 0; e < 2; ++e) {
+                head.eyePose[e] = views[e].pose;
+                head.eyePose[e].orientation = head.pose.orientation;  // includes any developer fake yaw
             }
             const std::scoped_lock lock(g_poseMutex);
             g_latest = head;
@@ -670,20 +716,25 @@ void SubmitDesktopFrame(plume::RenderTexture* image, uint32_t width, uint32_t he
                 x.xrReleaseSwapchainImage(s.quad.handle, &release);
             }
 
-            if (RequestedMode() == Mode::Mono) {
+            if (RequestedMode() == Mode::Mono || RequestedMode() == Mode::Stereo) {
+                const bool stereo = RequestedMode() == Mode::Stereo;
                 HeadPose rendered;
                 {
                     const std::scoped_lock lock(g_poseMutex);
                     rendered = g_rendered;
                 }
                 if (rendered.valid) {
-                    const XrFovf fov = ToFov(MonoTangents(rendered));
+                    const XrFovf monoFov = ToFov(MonoTangents(rendered));
+                    const int32_t half = int32_t(width / 2);
                     for (int e = 0; e < 2; ++e) {
                         projectionViews[e] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
-                        projectionViews[e].pose = rendered.pose;
-                        projectionViews[e].fov = fov;
+                        projectionViews[e].pose = stereo ? rendered.eyePose[e] : rendered.pose;
+                        projectionViews[e].fov = stereo ? ToFov(rendered.eye[e]) : monoFov;
                         projectionViews[e].subImage.swapchain = s.quad.handle;
-                        projectionViews[e].subImage.imageRect = {{0, 0}, {int32_t(width), int32_t(height)}};
+                        // Stereo: the game drew the left eye into the left half, the right eye into the right half.
+                        projectionViews[e].subImage.imageRect = stereo
+                            ? XrRect2Di{{e == 0 ? 0 : half, 0}, {half, int32_t(height)}}
+                            : XrRect2Di{{0, 0}, {int32_t(width), int32_t(height)}};
                     }
                     projection.space = s.local;
                     projection.viewCount = 2;
