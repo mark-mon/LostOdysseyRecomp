@@ -30,6 +30,14 @@ void StoreFloat(uint32_t address, float value)
 {
     *reinterpret_cast<uint32_t*>(g_memory.base + address) = __builtin_bswap32(std::bit_cast<uint32_t>(value));
 }
+uint32_t LoadWord(uint32_t address)
+{
+    return __builtin_bswap32(*reinterpret_cast<const uint32_t*>(g_memory.base + address));
+}
+void StoreWord(uint32_t address, uint32_t value)
+{
+    *reinterpret_cast<uint32_t*>(g_memory.base + address) = __builtin_bswap32(value);
+}
 }
 
 PPC_FUNC(sub_82300158)
@@ -40,6 +48,9 @@ PPC_FUNC(sub_82300158)
         __imp__sub_82300158(ctx, base);
         return;
     }
+    // LO_VR_STEREO_TEST (developer): "left" builds only the left-eye view (half rectangle);
+    // "nullstate" gives the right eye no FSceneViewState instead of sharing the player's.
+    static const std::string test = [] { const char* v = getenv("LO_VR_STEREO_TEST"); return std::string(v ? v : ""); }();
     const float originX = LoadFloat(player + 0x68);
     const float sizeX = LoadFloat(player + 0x70);
     const PPCContext arguments = ctx;
@@ -49,10 +60,16 @@ PPC_FUNC(sub_82300158)
     __imp__sub_82300158(ctx, base);
     const auto leftResult = ctx.r3;
 
-    ctx = arguments;
-    vr::SetCurrentEye(1);
-    StoreFloat(player + 0x68, originX + sizeX * 0.5f);
-    __imp__sub_82300158(ctx, base);
+    if (test != "left")
+    {
+        ctx = arguments;
+        vr::SetCurrentEye(1);
+        StoreFloat(player + 0x68, originX + sizeX * 0.5f);
+        const uint32_t viewState = LoadWord(player + 0x78);
+        if (test == "nullstate") StoreWord(player + 0x78, 0);
+        __imp__sub_82300158(ctx, base);
+        StoreWord(player + 0x78, viewState);
+    }
 
     vr::SetCurrentEye(-1);
     StoreFloat(player + 0x68, originX);
