@@ -11950,7 +11950,15 @@ void main()
                 // into each eye's half instead of across both.
                 std::array<RenderViewport, 2> hudEyes;
                 std::array<RenderRect, 2> hudScissors;
-                const bool hudPerEye = color && !depthOnlyRaster && vr::StereoViewsActive() &&
+                // The game also draws the finished 3D frame as a canvas tile: a draw
+                // that samples a full-size resolved surface (the scene) stays whole.
+                const auto samplesFullFrame = [&] {
+                    const uint32_t fetch0 = Reg(REG_FETCH_CONSTANTS), fetch1 = Reg(REG_FETCH_CONSTANTS + 1);
+                    if ((fetch0 & 3) != 2) return false;
+                    const auto* source = FindResolved((fetch1 >> 12) << 12, fetch1 & 0x3f);
+                    return source && source->tex && source->tex->guestWidth >= 1200;
+                };
+                const bool hudPerEye = color && !depthOnlyRaster && vr::StereoViewsActive() && !samplesFullFrame() &&
                     vr::HudEyeRects(rasterViewport, attachmentWidth, attachmentHeight, color->guestWidth, key.vs, key.ps,
                         hudEyes.data(), hudScissors.data());
                 for (uint32_t pass = 0; pass < (hudPerEye ? 2u : 1u); ++pass)

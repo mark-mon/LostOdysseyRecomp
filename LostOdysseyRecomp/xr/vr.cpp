@@ -639,6 +639,31 @@ bool HudEyeRects(const plume::RenderViewport& viewport, int32_t targetWidth, int
         viewport.height > float(targetHeight) + 0.5f)
     { note("rejected: not full width"); return false; }
     if (vertexShader == FullScreenQuadVS) { note("rejected: full-screen quad"); return false; }
+    // LO_VR_HUD_VS / LO_VR_HUD_PS=<hex>[,<hex>...] (developer): only these shaders count as HUD.
+    auto parseList = [](const char* name) {
+        std::vector<uint64_t> list;
+        if (const char* v = getenv(name))
+            for (const char* p = v; *p;) {
+                char* end = nullptr;
+                const uint64_t value = strtoull(p, &end, 16);
+                if (end == p) break;
+                list.push_back(value);
+                p = *end == ',' ? end + 1 : end;
+            }
+        return list;
+    };
+    // Default: the game's 2D canvas vertex shader (UE3 simple elements: HUD,
+    // menus, fades). The renderer has already excluded the full-frame scene tile.
+    static const std::vector<uint64_t> allowedVs = [&] {
+        auto list = parseList("LO_VR_HUD_VS");
+        if (list.empty()) list.push_back(0xeb5f611c4321708eull);
+        return list;
+    }();
+    static const std::vector<uint64_t> allowedPs = parseList("LO_VR_HUD_PS");
+    if (!allowedVs.empty() && std::find(allowedVs.begin(), allowedVs.end(), vertexShader) == allowedVs.end())
+    { note("rejected: not in LO_VR_HUD_VS"); return false; }
+    if (!allowedPs.empty() && std::find(allowedPs.begin(), allowedPs.end(), pixelShader) == allowedPs.end())
+    { note("rejected: not in LO_VR_HUD_PS"); return false; }
     const float aspect = viewport.width / viewport.height;
     if (std::abs(aspect - 16.0f / 9.0f) > 0.05f) { note("rejected: aspect"); return false; }
     note("taken");
