@@ -45,7 +45,9 @@ std::string PreferredDeviceName() { return {}; }
 void OnDeviceCreated(plume::RenderDevice*, plume::RenderCommandQueue*) {}
 void SubmitDesktopFrame(plume::RenderTexture*, uint32_t, uint32_t, std::vector<plume::RenderCommandSemaphore*>&) {}
 bool AdjustMainView(uint32_t) { return false; }
+void SetFrameSource(plume::RenderTexture*, uint32_t, uint32_t) {}
 bool StereoViewsActive() { return false; }
+bool HudEyeRects(const plume::RenderViewport&, int32_t, int32_t, uint32_t, plume::RenderViewport*, plume::RenderRect*) { return false; }
 void SetCurrentEye(int) {}
 bool Active() { return false; }
 void Shutdown() {}
@@ -518,6 +520,43 @@ void OnDeviceCreated(plume::RenderDevice* device, plume::RenderCommandQueue* que
         s.queue->familyIndex, s.queue->queueIndex);
 }
 
+struct FrameSource
+{
+    plume::RenderTexture* texture = nullptr;
+    uint32_t width = 0, height = 0;
+    uint64_t frames = 0;  // s.frames when it was handed over (valid for that present only)
+};
+std::mutex g_sourceMutex;
+FrameSource g_source;
+
+VkImageLayout ToVkLayout(plume::RenderTextureLayout layout)
+{
+    switch (layout) {
+    case plume::RenderTextureLayout::GENERAL: return VK_IMAGE_LAYOUT_GENERAL;
+    case plume::RenderTextureLayout::SHADER_READ: return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    case plume::RenderTextureLayout::COLOR_WRITE: return VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    case plume::RenderTextureLayout::COPY_SOURCE:
+    case plume::RenderTextureLayout::RESOLVE_SOURCE: return VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    case plume::RenderTextureLayout::COPY_DEST:
+    case plume::RenderTextureLayout::RESOLVE_DEST: return VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    case plume::RenderTextureLayout::PRESENT: return VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    default: return VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+}
+
+void SetFrameSource(plume::RenderTexture* texture, uint32_t width, uint32_t height)
+{
+    if (!s.running || RequestedMode() == Mode::Theater) return;
+    static uint32_t logged = 0;
+    if (texture && logged++ < 1) {
+        auto* vk = static_cast<plume::VulkanTexture*>(texture);
+        LOG_NOTICE("vr: game frame source {}x{} (texture {}x{} format {})", width, height,
+            vk->desc.width, vk->desc.height, int(vk->imageFormat));
+    }
+    const std::scoped_lock lock(g_sourceMutex);
+    g_source = {texture, width, height, s.frames};
+}
+
 bool AdjustMainView(uint32_t view)
 {
     const Mode mode = RequestedMode();
@@ -569,6 +608,45 @@ bool StereoViewsActive()
 }
 
 void SetCurrentEye(int eye) { t_eye = eye; }
+
+bool HudEyeRects(const plume::RenderViewport& viewport, int32_t targetWidth, int32_t targetHeight, uint32_t guestWidth,
+                 plume::RenderViewport* eyes, plume::RenderRect* scissors)
+{
+    // Diagnostics: the first wide draws and why they were (not) taken as HUD.
+    static std::atomic<uint32_t> logged{0};
+    const bool wide = viewport.width > float(targetWidth) * 0.6f;
+    auto note = [&](const char* verdict) {
+        if (wide && logged.fetch_add(1) < 24)
+            LOG_NOTICE("vr: hud candidate {} viewport ({:.1f},{:.1f} {:.1f}x{:.1f}) target {}x{} guest width {}",
+                verdict, viewport.x, viewport.y, viewport.width, viewport.height, targetWidth, targetHeight, guestWidth);
+    };
+    // Only the guest's full-size output (1280 wide in guest space) carries the HUD.
+    if (guestWidth < 1200 || targetWidth <= 0 || targetHeight <= 0) { note("rejected: guest width"); return false; }
+    if (viewport.x > 0.5f || viewport.y > 0.5f || viewport.width < float(targetWidth) - 1.0f ||
+        viewport.height < float(targetHeight) - 1.0f)
+    { note("rejected: not full target"); return false; }
+    const float aspect = float(targetWidth) / float(targetHeight);
+    if (std::abs(aspect - 16.0f / 9.0f) > 0.05f) { note("rejected: aspect"); return false; }
+    note("taken");
+    // LO_VR_HUD_SCALE: panel width as a fraction of one eye's width (default 0.75).
+    static const float scale = [] {
+        const char* v = getenv("LO_VR_HUD_SCALE");
+        const float f = v ? float(atof(v)) : 0.0f;
+        return f > 0.05f && f <= 1.0f ? f : 0.75f;
+    }();
+    const float half = float(targetWidth) * 0.5f;
+    float w = half * scale, h = w / aspect;
+    if (h > float(targetHeight)) { h = float(targetHeight); w = h * aspect; }
+    for (int e = 0; e < 2; ++e) {
+        eyes[e] = viewport;
+        eyes[e].x = float(e) * half + (half - w) * 0.5f;
+        eyes[e].y = (float(targetHeight) - h) * 0.5f;
+        eyes[e].width = w;
+        eyes[e].height = h;
+        scissors[e] = plume::RenderRect(int32_t(float(e) * half), 0, int32_t(float(e + 1) * half), targetHeight);
+    }
+    return true;
+}
 
 bool Active() { return s.running; }
 
@@ -627,7 +705,24 @@ void SubmitDesktopFrame(plume::RenderTexture* image, uint32_t width, uint32_t he
         }
     }
 
+    // Prefer the game's own final frame (internal resolution, before desktop
+    // scaling); fall back to the finished desktop image (host menus, no game frame).
     auto* source = static_cast<plume::VulkanTexture*>(image);
+    VkImageLayout sourceLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    {
+        const std::scoped_lock lock(g_sourceMutex);
+        if (g_source.texture && g_source.frames == s.frames) {
+            auto* frame = static_cast<plume::VulkanTexture*>(g_source.texture);
+            const VkImageLayout layout = ToVkLayout(frame->textureLayout);
+            if (layout != VK_IMAGE_LAYOUT_UNDEFINED && g_source.width && g_source.height) {
+                source = frame;
+                sourceLayout = layout;
+                width = g_source.width;
+                height = g_source.height;
+            }
+        }
+        g_source.texture = nullptr;
+    }
     XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     XrCompositionLayerProjectionView projectionViews[2] = {};
@@ -660,7 +755,7 @@ void SubmitDesktopFrame(plume::RenderTexture* image, uint32_t width, uint32_t he
             // The desktop image was rendered by earlier submissions on this queue.
             toCopy[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
             toCopy[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            toCopy[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            toCopy[0].oldLayout = sourceLayout;
             toCopy[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             toCopy[0].image = source->vk;
             toCopy[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -683,7 +778,7 @@ void SubmitDesktopFrame(plume::RenderTexture* image, uint32_t width, uint32_t he
             back[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
             back[0].dstAccessMask = 0;
             back[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            back[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            back[0].newLayout = sourceLayout;
             back[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             back[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
             back[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;

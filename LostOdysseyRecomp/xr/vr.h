@@ -17,6 +17,8 @@ struct RenderCommandSemaphore;
 struct RenderDevice;
 struct RenderTexture;
 struct VulkanExtensionHooks;
+struct RenderViewport;
+struct RenderRect;
 }
 
 namespace vr
@@ -63,6 +65,19 @@ bool AdjustMainView(uint32_t view);
 bool StereoViewsActive();
 // Eye whose FSceneView is being built on this thread (0 left, 1 right, -1 none).
 void SetCurrentEye(int eye);
+
+// Stereo, renderer thread: a draw with `viewport` into a target of the given
+// size is the game's 2D canvas (HUD, menus, fades) when it covers the whole
+// full-size 16:9 output (the eye views use half-width viewports). Then fills one
+// viewport and scissor per eye (a centred, aspect-correct panel in each half)
+// and returns true.
+bool HudEyeRects(const plume::RenderViewport& viewport, int32_t targetWidth, int32_t targetHeight, uint32_t guestWidth,
+                 plume::RenderViewport* eyes, plume::RenderRect* scissors);
+
+// Present thread: the game's final frame for this present (internal
+// resolution, 8-bit RGBA, before desktop scaling); the VR copy prefers it over
+// the desktop swap chain image. Not used in theater mode.
+void SetFrameSource(plume::RenderTexture* texture, uint32_t width, uint32_t height);
 
 // Session is running and frames are being submitted.
 bool Active();

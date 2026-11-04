@@ -1,5 +1,6 @@
 #include <source_location>
 #include "taa_binding_evidence.h"
+#include "xr/vr.h"
 #include "scene_aa_provenance.h"
 #include "scene_copy_promotion_policy.h"
 #include "scene_copy_promotion_shaders.h"
@@ -11942,11 +11943,35 @@ void main()
                 {
                     RenderIndexBufferView view(RenderBufferReference(preparedIndexBuffer, preparedIndexOffset), uint32_t(indices.size() * 4), RenderFormat::R32_UINT);
                     commandList->setIndexBuffer(&view);
-                    commandList->drawIndexedInstanced(indexCount, 1, 0, baseVertex, 0);
                 }
-                else
+                // VR stereo: the eye views (and their post-processing) draw with
+                // half-width viewports; a full-width draw into the full-size 16:9
+                // output is the game's 2D canvas (HUD, menus, fades). Draw it once
+                // into each eye's half instead of across both.
+                std::array<RenderViewport, 2> hudEyes;
+                std::array<RenderRect, 2> hudScissors;
+                const bool hudPerEye = color && !depthOnlyRaster && vr::StereoViewsActive() &&
+                    vr::HudEyeRects(rasterViewport, attachmentWidth, attachmentHeight, color->guestWidth,
+                        hudEyes.data(), hudScissors.data());
+                for (uint32_t pass = 0; pass < (hudPerEye ? 2u : 1u); ++pass)
                 {
-                    commandList->drawInstanced(indexCount, 1, uint32_t(baseVertex), 0);
+                    if (hudPerEye)
+                    {
+                        RenderRect eyeScissor(std::max(scissor.left, hudScissors[pass].left), std::max(scissor.top, hudScissors[pass].top),
+                            std::min(scissor.right, hudScissors[pass].right), std::min(scissor.bottom, hudScissors[pass].bottom));
+                        if (eyeScissor.right <= eyeScissor.left || eyeScissor.bottom <= eyeScissor.top) continue;
+                        commandList->setViewports(&hudEyes[pass], 1);
+                        commandList->setScissors(&eyeScissor, 1);
+                    }
+                    if (useIndices)
+                        commandList->drawIndexedInstanced(indexCount, 1, 0, baseVertex, 0);
+                    else
+                        commandList->drawInstanced(indexCount, 1, uint32_t(baseVertex), 0);
+                }
+                if (hudPerEye)
+                {
+                    commandList->setViewports(&rasterViewport, 1);
+                    commandList->setScissors(&scissor, 1);
                 }
                 recordProbe.Enter(record_timing::Phase::Occlusion);
                 // A counted draw leaves its variant bound: the next draw binds and

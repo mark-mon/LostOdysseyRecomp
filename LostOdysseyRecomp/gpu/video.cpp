@@ -5290,6 +5290,7 @@ namespace gpu::video
                 uint32_t sourceWidth=width, sourceHeight=height;
                 renderer::ScaleResolvedSize(physicalAddress & 0x1FFFFFFF, sourceWidth, sourceHeight);
                 sourceWidth=std::min(sourceWidth,rw); sourceHeight=std::min(sourceHeight,rh);
+                if (g_vulkan && vr::RequestedMode() != vr::Mode::Off) vr::SetFrameSource(source, sourceWidth, sourceHeight);
                 // The producer froze this with its guest commands. A live game
                 // state can already describe a later frame than this resolve.
                 const bool drawCinematicBars = sourcePlan.cpuSerial ? sourcePlan.cinematicBars : cinematicBars;
