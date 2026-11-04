@@ -45,6 +45,7 @@ std::string PreferredDeviceName() { return {}; }
 void OnDeviceCreated(plume::RenderDevice*, plume::RenderCommandQueue*) {}
 void SubmitDesktopFrame(plume::RenderTexture*, uint32_t, uint32_t, std::vector<plume::RenderCommandSemaphore*>&) {}
 bool AdjustMainView(uint32_t) { return false; }
+void RequestRecenter() {}
 void SetFrameSource(plume::RenderTexture*, uint32_t, uint32_t) {}
 bool StereoViewsActive() { return false; }
 bool HudEyeRects(const plume::RenderViewport&, int32_t, int32_t, uint32_t, uint64_t, uint64_t, plume::RenderViewport*, plume::RenderRect*) { return false; }
@@ -64,7 +65,7 @@ namespace
     X(xrCreateSwapchain) X(xrDestroySwapchain) X(xrEnumerateSwapchainImages) X(xrAcquireSwapchainImage) \
     X(xrWaitSwapchainImage) X(xrReleaseSwapchainImage) X(xrWaitFrame) X(xrBeginFrame) X(xrEndFrame) \
     X(xrGetVulkanInstanceExtensionsKHR) X(xrGetVulkanDeviceExtensionsKHR) X(xrGetVulkanGraphicsDeviceKHR) \
-    X(xrGetVulkanGraphicsRequirementsKHR) X(xrLocateViews)
+    X(xrGetVulkanGraphicsRequirementsKHR) X(xrLocateViews) X(xrLocateSpace)
 
 struct Api
 {
@@ -137,11 +138,18 @@ struct State
     XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
     bool running = false;
     XrSpace local = XR_NULL_HANDLE;
+    XrSpace view = XR_NULL_HANDLE;  // the head, for recentering
     Swapchain quad;
     VkCommandPool pool = VK_NULL_HANDLE;
     std::array<FrameSlot, 3> slots;
     uint32_t slot = 0;
     uint64_t frames = 0, droppedNotRendering = 0;
+    int64_t displayPeriodNs = 0;  // from xrWaitFrame: the runtime's frame period
+    // Timing of the frame loop since the last stats line (seconds / counts).
+    double waitSeconds = 0, endSeconds = 0, betweenSeconds = 0;
+    int64_t lastDisplayTime = 0, displayStepSum = 0;
+    uint64_t timedFrames = 0, displaySteps = 0;
+    std::chrono::steady_clock::time_point lastSubmitEnd{};
     std::chrono::steady_clock::time_point statsTime{};
 
     // Theater placement (metres, in the LOCAL space: origin at the head when the session started).
@@ -418,8 +426,15 @@ void LogStats()
     if (now - s.statsTime < std::chrono::seconds(10)) return;
     const double seconds = std::chrono::duration<double>(now - s.statsTime).count();
     static uint64_t lastFrames = 0;
-    LOG_NOTICE("vr: stats {:.1f} fps submitted, state {}, not-rendered {}", (s.frames - lastFrames) / seconds,
-        int(s.sessionState), s.droppedNotRendering);
+    const double n = s.timedFrames ? double(s.timedFrames) : 1.0;
+    LOG_NOTICE("vr: stats {:.1f} fps submitted, runtime period {:.2f} ms ({:.1f} Hz), state {}, not-rendered {}; "
+        "per frame: xrWaitFrame {:.2f} ms, xrEndFrame {:.2f} ms, game between submits {:.2f} ms, display time step {:.2f} ms",
+        (s.frames - lastFrames) / seconds, s.displayPeriodNs / 1e6, s.displayPeriodNs ? 1e9 / double(s.displayPeriodNs) : 0.0,
+        int(s.sessionState), s.droppedNotRendering, s.waitSeconds * 1e3 / n, s.endSeconds * 1e3 / n, s.betweenSeconds * 1e3 / n,
+        s.displaySteps ? double(s.displayStepSum) / double(s.displaySteps) / 1e6 : 0.0);
+    s.waitSeconds = s.endSeconds = s.betweenSeconds = 0;
+    s.timedFrames = s.displaySteps = 0;
+    s.displayStepSum = 0;
     lastFrames = s.frames;
     s.statsTime = now;
 }
@@ -500,6 +515,10 @@ void OnDeviceCreated(plume::RenderDevice* device, plume::RenderCommandQueue* que
     space.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
     space.poseInReferenceSpace.orientation.w = 1.0f;
     Check(x.xrCreateReferenceSpace(s.session, &space, &s.local), "xrCreateReferenceSpace");
+    XrReferenceSpaceCreateInfo head{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+    head.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+    head.poseInReferenceSpace.orientation.w = 1.0f;
+    Check(x.xrCreateReferenceSpace(s.session, &head, &s.view), "xrCreateReferenceSpace(view)");
 
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -518,6 +537,54 @@ void OnDeviceCreated(plume::RenderDevice* device, plume::RenderCommandQueue* que
     }
     LOG_NOTICE("vr: session created on '{}' queue family {} index {}", s.device->description.name,
         s.queue->familyIndex, s.queue->queueIndex);
+}
+
+std::atomic<bool> g_recenterRequested{false};
+XrPosef g_recenterBase{{0, 0, 0, 1}, {0, 0, 0}};  // LOCAL space origin relative to the runtime's original LOCAL
+
+XrPosef ComposePose(const XrPosef& a, const XrPosef& b)  // a then b: b expressed in a's frame
+{
+    const XrQuaternionf& q = a.orientation; const XrQuaternionf& r = b.orientation;
+    XrPosef out;
+    out.orientation = {q.w * r.x + q.x * r.w + q.y * r.z - q.z * r.y,
+                       q.w * r.y - q.x * r.z + q.y * r.w + q.z * r.x,
+                       q.w * r.z + q.x * r.y - q.y * r.x + q.z * r.w,
+                       q.w * r.w - q.x * r.x - q.y * r.y - q.z * r.z};
+    // rotate b.position by q
+    const float vx = b.position.x, vy = b.position.y, vz = b.position.z;
+    const float tx = 2 * (q.y * vz - q.z * vy), ty = 2 * (q.z * vx - q.x * vz), tz = 2 * (q.x * vy - q.y * vx);
+    out.position = {a.position.x + vx + q.w * tx + (q.y * tz - q.z * ty),
+                    a.position.y + vy + q.w * ty + (q.z * tx - q.x * tz),
+                    a.position.z + vz + q.w * tz + (q.x * ty - q.y * tx)};
+    return out;
+}
+
+// Rebuilds the LOCAL space so the head's current yaw and position become the origin.
+void ApplyRecenter(XrTime time)
+{
+    if (!g_recenterRequested.exchange(false) || !s.view || !s.local) return;
+    XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+    if (XR_FAILED(x.xrLocateSpace(s.view, s.local, time, &location)) ||
+        !(location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) ||
+        !(location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) {
+        LOG_WARNING("vr: recenter skipped (head pose not valid)");
+        return;
+    }
+    // Yaw only: the horizon stays level.
+    const XrQuaternionf& q = location.pose.orientation;
+    const float yaw = std::atan2(2.0f * (q.w * q.y + q.x * q.z), 1.0f - 2.0f * (q.y * q.y + q.x * q.x));
+    XrPosef offset{{0, std::sin(yaw * 0.5f), 0, std::cos(yaw * 0.5f)}, location.pose.position};
+    const XrPosef base = ComposePose(g_recenterBase, offset);
+    XrReferenceSpaceCreateInfo space{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+    space.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    space.poseInReferenceSpace = base;
+    XrSpace recentered = XR_NULL_HANDLE;
+    if (!Check(x.xrCreateReferenceSpace(s.session, &space, &recentered), "xrCreateReferenceSpace(recenter)")) return;
+    x.xrDestroySpace(s.local);
+    s.local = recentered;
+    g_recenterBase = base;
+    LOG_NOTICE("vr: recentered (yaw {:.1f} deg, head at {:.2f} {:.2f} {:.2f} m)", yaw * 57.2958f,
+        location.pose.position.x, location.pose.position.y, location.pose.position.z);
 }
 
 struct FrameSource
@@ -609,6 +676,8 @@ bool StereoViewsActive()
 
 void SetCurrentEye(int eye) { t_eye = eye; }
 
+void RequestRecenter() { g_recenterRequested = true; }
+
 bool HudEyeRects(const plume::RenderViewport& viewport, int32_t targetWidth, int32_t targetHeight, uint32_t guestWidth,
                  uint64_t vertexShader, uint64_t pixelShader, plume::RenderViewport* eyes, plume::RenderRect* scissors)
 {
@@ -699,9 +768,20 @@ void SubmitDesktopFrame(plume::RenderTexture* image, uint32_t width, uint32_t he
 
     XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
     XrFrameState frameState{XR_TYPE_FRAME_STATE};
+    const auto waitStart = std::chrono::steady_clock::now();
+    if (s.lastSubmitEnd.time_since_epoch().count())
+        s.betweenSeconds += std::chrono::duration<double>(waitStart - s.lastSubmitEnd).count();
     if (!Check(x.xrWaitFrame(s.session, &waitInfo, &frameState), "xrWaitFrame")) return;
+    s.waitSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - waitStart).count();
+    s.displayPeriodNs = frameState.predictedDisplayPeriod;
+    if (s.lastDisplayTime && frameState.predictedDisplayTime > s.lastDisplayTime) {
+        s.displayStepSum += frameState.predictedDisplayTime - s.lastDisplayTime;
+        ++s.displaySteps;
+    }
+    s.lastDisplayTime = frameState.predictedDisplayTime;
     XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
     if (!Check(x.xrBeginFrame(s.session, &beginInfo), "xrBeginFrame")) return;
+    ApplyRecenter(frameState.predictedDisplayTime);
 
     if (RequestedMode() == Mode::Mono || RequestedMode() == Mode::Stereo) {
         XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
@@ -900,11 +980,15 @@ void SubmitDesktopFrame(plume::RenderTexture* image, uint32_t width, uint32_t he
     endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     endInfo.layerCount = layerCount;
     endInfo.layers = layerCount ? layers : nullptr;
+    const auto endStart = std::chrono::steady_clock::now();
     {
         // The runtime submits on our queue during xrEndFrame.
         const std::scoped_lock lock(*s.queue->queue->mutex);
         Check(x.xrEndFrame(s.session, &endInfo), "xrEndFrame");
     }
+    s.lastSubmitEnd = std::chrono::steady_clock::now();
+    s.endSeconds += std::chrono::duration<double>(s.lastSubmitEnd - endStart).count();
+    ++s.timedFrames;
     ++s.frames;
 }
 
@@ -921,6 +1005,7 @@ void Shutdown()
         s.pool = VK_NULL_HANDLE;
     }
     if (s.local) { x.xrDestroySpace(s.local); s.local = XR_NULL_HANDLE; }
+    if (s.view) { x.xrDestroySpace(s.view); s.view = XR_NULL_HANDLE; }
     if (s.session) { x.xrDestroySession(s.session); s.session = XR_NULL_HANDLE; }
     if (s.instance) { x.xrDestroyInstance(s.instance); s.instance = XR_NULL_HANDLE; }
     s.running = false;

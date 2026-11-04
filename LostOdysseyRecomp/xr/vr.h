@@ -80,6 +80,10 @@ bool HudEyeRects(const plume::RenderViewport& viewport, int32_t targetWidth, int
 // the desktop swap chain image. Not used in theater mode.
 void SetFrameSource(plume::RenderTexture* texture, uint32_t width, uint32_t height);
 
+// Recenter (F9 or both sticks clicked): the current head yaw and position
+// become forward / origin. Applied on the next VR frame; any thread.
+void RequestRecenter();
+
 // Session is running and frames are being submitted.
 bool Active();
 

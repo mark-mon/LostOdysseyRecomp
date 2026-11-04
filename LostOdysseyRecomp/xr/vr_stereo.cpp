@@ -2,6 +2,7 @@
 
 #include "xr/vr.h"
 #include "kernel/memory.h"
+#include <os/logger.h>
 
 // Native stereo through UE3's own split-screen path.
 //
@@ -21,6 +22,7 @@
 // only loses its occlusion history. TODO: give the right eye a state of its own.
 
 extern "C" PPC_FUNC(__imp__sub_82300158);
+extern "C" PPC_FUNC(__imp__sub_82486C88);
 
 namespace
 {
@@ -42,6 +44,32 @@ void StoreWord(uint32_t address, uint32_t value)
 }
 }
 
+namespace
+{
+// Developer probe (LO_VR_ALLOC_PROBE=1): remember recent guest allocations so the
+// player's FSceneViewState can be traced back to the code that allocated it.
+struct Allocation { uint32_t address, size, caller; };
+constexpr uint32_t AllocationRing = 1u << 20;
+std::array<Allocation, AllocationRing> g_allocations{};
+std::atomic<uint32_t> g_allocationCount{0};
+bool AllocationProbe()
+{
+    static const bool enabled = [] { const char* v = getenv("LO_VR_ALLOC_PROBE"); return v && v[0] == '1'; }();
+    return enabled;
+}
+}
+
+// Guest operator new / appMalloc (r3 size; returns r3). Only records when the probe is on.
+PPC_FUNC(sub_82486C88)
+{
+    const uint32_t size = ctx.r3.u32, caller = uint32_t(ctx.lr);
+    __imp__sub_82486C88(ctx, base);
+    if (AllocationProbe()) {
+        const uint32_t i = g_allocationCount.fetch_add(1, std::memory_order_relaxed);
+        g_allocations[i % AllocationRing] = {ctx.r3.u32, size, caller};
+    }
+}
+
 PPC_FUNC(sub_82300158)
 {
     const uint32_t player = ctx.r3.u32;
@@ -53,6 +81,29 @@ PPC_FUNC(sub_82300158)
     // LO_VR_STEREO_TEST (developer): "left" builds only the left-eye view (half rectangle);
     // "shared" lets the right eye share the player's FSceneViewState (shows the colour corruption).
     static const std::string test = [] { const char* v = getenv("LO_VR_STEREO_TEST"); return std::string(v ? v : ""); }();
+    {
+        // One-time facts for giving the right eye a view state of its own.
+        static bool logged = false;
+        const uint32_t state = LoadWord(player + 0x78);
+        if (!logged && state > 0x10000) {
+            logged = true;
+            LOG_NOTICE("vr: player {:08x} view state {:08x} words {:08x} {:08x} {:08x} {:08x}", player, state,
+                LoadWord(state), LoadWord(state + 4), LoadWord(state + 8), LoadWord(state + 12));
+            if (AllocationProbe()) {
+                const uint32_t count = std::min(g_allocationCount.load(), AllocationRing);
+                bool found = false;
+                for (uint32_t i = 0; i < count; ++i) {
+                    const auto& a = g_allocations[i];
+                    if (a.address && state >= a.address && state < a.address + a.size) {
+                        LOG_NOTICE("vr: view state allocation {:08x} size {:#x} caller {:08x} (state offset {:#x})",
+                            a.address, a.size, a.caller, state - a.address);
+                        found = true;
+                    }
+                }
+                if (!found) LOG_NOTICE("vr: view state not in the last {} allocations", count);
+            }
+        }
+    }
     const float originX = LoadFloat(player + 0x68);
     const float sizeX = LoadFloat(player + 0x70);
     const PPCContext arguments = ctx;

@@ -9,6 +9,7 @@ extern std::atomic<uint32_t> g_presentedSwaps;
 #include <SDL3/SDL.h>
 #include <settings/menu.h>
 #include <debug/menu_overlay.h>
+#include <xr/vr.h>
 #include <debug/frame_timing.h>
 #include "test_input_pulse.h"
 #include "controller_prompts.h"
@@ -369,6 +370,14 @@ static void ProcessHostInput(uint16_t buttons, uint8_t lt, uint8_t rt)
         else if ((pressed & XAMINPUT_GAMEPAD_RIGHT_SHOULDER) && !curChord) debug_menu::HandleInput(debug_menu::InputAction::NextTab);
         else if (leftPressed && rt <= 32) debug_menu::HandleInput(debug_menu::InputAction::PrevCategory);
         else if (rightPressed && lt <= 32) debug_menu::HandleInput(debug_menu::InputAction::NextCategory);
+    }
+    // VR recenter: both sticks clicked together. Held back from the game for that press.
+    const uint16_t recenterMask = 0x0040 | 0x0080;  // XInput left / right thumb (stick click)
+    if (vr::RequestedMode() != vr::Mode::Off && (buttons & recenterMask) == recenterMask &&
+        (s_prevGamepadButtons & recenterMask) != recenterMask)
+    {
+        s_quarantinedButtons |= recenterMask;
+        vr::RequestRecenter();
     }
     s_prevGamepadButtons = buttons;
 }

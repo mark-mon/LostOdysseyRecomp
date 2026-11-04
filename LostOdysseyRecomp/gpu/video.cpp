@@ -3793,6 +3793,9 @@ namespace gpu::video
             }
             if (event.type == SDL_EVENT_KEY_DOWN)
                 LOG_INFO("video key: {} name: '{}' repeat {}", event.key.key, SDL_GetKeyName(event.key.key), event.key.repeat);
+            if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F9 &&
+                vr::RequestedMode() != vr::Mode::Off)
+                vr::RequestRecenter();
             if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F1)
             {
                 LOG_INFO("[host_ui] F1 key triggered!");
