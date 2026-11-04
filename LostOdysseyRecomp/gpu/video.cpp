@@ -4,6 +4,7 @@
 #include <stdafx.h>
 #endif
 #include "video.h"
+#include "xr/vr.h"
 #include "frame_plan.h"
 #if defined(LO_GPU_PLUME) || defined(LO_VIDEO_SUBMISSION_UNIT)
 #include "backend_device.h"
@@ -2593,9 +2594,9 @@ namespace gpu::video
                     }
                 }
                 startupWatch.Step("Vulkan instance creation");
-                g_interface = plume::CreateVulkanInterface(g_fgDispatch ? g_fgDispatch->Hooks() : g_dlssController->ExtensionHooks());
+                g_interface = plume::CreateVulkanInterface(vr::WrapVulkanHooks(g_fgDispatch ? g_fgDispatch->Hooks() : g_dlssController->ExtensionHooks()));
 #else
-                g_interface = plume::CreateVulkanInterface(g_dlssController->ExtensionHooks());
+                g_interface = plume::CreateVulkanInterface(vr::WrapVulkanHooks(g_dlssController->ExtensionHooks()));
 #endif
             } else {
                 // d3d12.dll and dxgi.dll are delay-loaded. A missing DLL or export would
@@ -2627,9 +2628,9 @@ namespace gpu::video
             g_dlssController = std::make_unique<dlss::Controller>(DlssApplicationDataPath(), DlssRuntimePath());
             g_temporalUpscaler = std::make_unique<TemporalUpscaler>(*g_dlssController);
             LoadCustomVulkanDriver();
-            g_interface = plume::CreateVulkanInterface(g_window, g_dlssController->ExtensionHooks());
+            g_interface = plume::CreateVulkanInterface(g_window, vr::WrapVulkanHooks(g_dlssController->ExtensionHooks()));
             if (!g_interface && RetryWithSystemVulkanDriver("instance creation"))
-                g_interface = plume::CreateVulkanInterface(g_window, g_dlssController->ExtensionHooks());
+                g_interface = plume::CreateVulkanInterface(g_window, vr::WrapVulkanHooks(g_dlssController->ExtensionHooks()));
 #endif
             if (!g_interface) return "API/loader initialization failed";
 #ifdef __ANDROID__
@@ -2666,7 +2667,7 @@ namespace gpu::video
 #if defined(__ANDROID__) && defined(LO_HAS_ADRENOTOOLS)
             if (!g_device && RetryWithSystemVulkanDriver("device creation")) {
                 g_interface.reset();
-                g_interface = plume::CreateVulkanInterface(g_window, g_dlssController->ExtensionHooks());
+                g_interface = plume::CreateVulkanInterface(g_window, vr::WrapVulkanHooks(g_dlssController->ExtensionHooks()));
                 if (!g_interface) return "API/loader initialization failed";
                 LogVulkanPhysicalDevices(static_cast<plume::VulkanInterface*>(g_interface.get())->instance);
                 g_device = g_interface->createDevice(preferredGpu);
@@ -2764,6 +2765,7 @@ namespace gpu::video
 #endif
             startupWatch.Step("command queue creation");
             g_queue = g_device->createCommandQueue(plume::RenderCommandListType::DIRECT);
+            if (g_vulkan && g_queue) vr::OnDeviceCreated(g_device.get(), g_queue.get());
             if (!g_queue) return "graphics queue creation failed";
 #ifdef _WIN32
             // DRED lists unfinished command lists by queue; unnamed ones are the SDKs'.
@@ -4911,6 +4913,13 @@ namespace gpu::video
     static bool PresentSwapchainImage(uint32_t imageIndex, plume::RenderCommandSemaphore** waits, uint32_t waitCount)
     {
         PresentScope progress(g_presentProgress, PresentStage::QueuePresent);
+        if (g_vulkan && vr::RequestedMode() != vr::Mode::Off) {
+            // VR copies the finished frame first; the desktop present then also waits for that copy.
+            thread_local std::vector<plume::RenderCommandSemaphore*> allWaits;
+            allWaits.assign(waits, waits + waitCount);
+            vr::SubmitDesktopFrame(g_swapChain->getTexture(imageIndex), g_swapChain->getWidth(), g_swapChain->getHeight(), allWaits);
+            return g_swapChain->present(imageIndex, allWaits.data(), uint32_t(allWaits.size()));
+        }
         return g_swapChain->present(imageIndex, waits, waitCount);
     }
 

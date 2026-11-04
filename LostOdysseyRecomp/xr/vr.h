@@ -1,0 +1,65 @@
+#pragma once
+
+// VR output through OpenXR (opt-in). The OpenXR loader is opened at runtime only
+// when VR is requested, so builds and players without a headset are unaffected.
+//
+// Phase 1 ("theater"): the finished desktop frame is shown on a quad in the
+// headset. Later phases add head tracking and per-eye scene views.
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace plume
+{
+struct RenderCommandQueue;
+struct RenderCommandSemaphore;
+struct RenderDevice;
+struct RenderTexture;
+struct VulkanExtensionHooks;
+}
+
+namespace vr
+{
+enum class Mode : uint32_t
+{
+    Off = 0,
+    Theater = 1,  // finished frame on a quad in front of the player
+    Mono = 2,     // one head-tracked view, the same image to both eyes (stepping stone to stereo)
+};
+
+// Requested at startup (LO_VR=theater|mono); fixed for the run.
+Mode RequestedMode();
+
+// Opens the loader, creates the OpenXR instance and finds the headset. Safe to
+// call more than once; returns false (and logs why) when VR cannot start.
+bool Initialize();
+
+// Vulkan: adds the instance/device extensions the runtime needs to the hooks
+// plume already uses for DLSS/Streamline. Returns `inner` unchanged when VR is off.
+plume::VulkanExtensionHooks WrapVulkanHooks(const plume::VulkanExtensionHooks& inner);
+
+// Name of the GPU the headset is attached to, or empty to keep the normal choice.
+std::string PreferredDeviceName();
+
+// Creates the OpenXR session on the game's device and graphics queue.
+void OnDeviceCreated(plume::RenderDevice* device, plume::RenderCommandQueue* queue);
+
+// Called on the present thread just before the desktop swap chain is presented.
+// `image` is the finished swap chain image (in present layout). Paces the
+// caller to the headset (xrWaitFrame) and may add a semaphore that the desktop
+// present must wait on.
+void SubmitDesktopFrame(plume::RenderTexture* image, uint32_t width, uint32_t height,
+                        std::vector<plume::RenderCommandSemaphore*>& presentWaits);
+
+// Game thread, from the FSceneView constructor hook (view+0x40 view matrix and
+// view+0x80 projection copied, nothing derived yet). Applies the head pose and
+// the headset field of view to the main camera. Returns true when it changed
+// the view (the caller then skips its own projection edits).
+bool AdjustMainView(uint32_t view);
+
+// Session is running and frames are being submitted.
+bool Active();
+
+void Shutdown();
+}

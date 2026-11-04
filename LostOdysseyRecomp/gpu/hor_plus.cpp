@@ -8,6 +8,7 @@
 #include "settings/config.h"
 #include "cpu/ppc_context.h"
 #include "kernel/memory.h"
+#include "xr/vr.h"
 
 extern "C" PPC_FUNC(__imp__sub_82300E50);
 extern "C" PPC_FUNC(__imp__sub_823BC220);
@@ -177,7 +178,11 @@ void HorPlusViewProjection(PPCRegister& r1, PPCRegister& r31)
     const uint32_t caller = LoadWord(r1.u32 + 0x1D8);
     const auto scale = SceneScale();
     if ((caller == 0x82300AFC || caller == 0x82307BEC) && IsMainPerspectiveView(r31.u32))
+    {
+        // VR replaces the projection with the headset frustum and adds the head pose.
+        if (vr::AdjustMainView(r31.u32)) return;
         ScaleProjection(r31.u32 + 0x80, scale);
+    }
 }
 
 // This alternate player-frustum path builds its own VP and frustum after the

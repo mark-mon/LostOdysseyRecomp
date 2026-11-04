@@ -177,6 +177,8 @@ add_custom_target(LoBuildRevision
     BYPRODUCTS "${LO_BUILD_REVISION_HEADER}" VERBATIM)
 add_dependencies(LostOdysseyRecomp LoBuildRevision)
 target_include_directories(LostOdysseyRecomp PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+# OpenXR headers (Apache-2.0); the loader is opened at runtime only when VR is requested (xr/vr.cpp).
+target_include_directories(LostOdysseyRecomp PRIVATE ${CMAKE_SOURCE_DIR}/thirdparty/openxr/include)
 # The game files rebuilt for model and text mods are cached under a key that
 # includes a hash of the code building them (modding/ and the readers it uses):
 # a release that leaves that code alone keeps the cache, any change rebuilds it.
