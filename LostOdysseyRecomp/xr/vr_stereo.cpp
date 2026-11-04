@@ -15,8 +15,10 @@
 // way it renders split-screen. The FSceneView hook (vr::AdjustMainView) gives
 // each view its eye's pose and frustum.
 //
-// Both eyes share the player's FSceneViewState (+0x78; occlusion history), so
-// the right eye reuses the left eye's occlusion results from the same frame.
+// The right eye is built without the player's FSceneViewState (+0x78). Sharing
+// one state between both views corrupts the post-processing history (the scene
+// colours came out false-coloured in both eyes); with no state the right eye
+// only loses its occlusion history. TODO: give the right eye a state of its own.
 
 extern "C" PPC_FUNC(__imp__sub_82300158);
 
@@ -49,7 +51,7 @@ PPC_FUNC(sub_82300158)
         return;
     }
     // LO_VR_STEREO_TEST (developer): "left" builds only the left-eye view (half rectangle);
-    // "nullstate" gives the right eye no FSceneViewState instead of sharing the player's.
+    // "shared" lets the right eye share the player's FSceneViewState (shows the colour corruption).
     static const std::string test = [] { const char* v = getenv("LO_VR_STEREO_TEST"); return std::string(v ? v : ""); }();
     const float originX = LoadFloat(player + 0x68);
     const float sizeX = LoadFloat(player + 0x70);
@@ -66,7 +68,7 @@ PPC_FUNC(sub_82300158)
         vr::SetCurrentEye(1);
         StoreFloat(player + 0x68, originX + sizeX * 0.5f);
         const uint32_t viewState = LoadWord(player + 0x78);
-        if (test == "nullstate") StoreWord(player + 0x78, 0);
+        if (test != "shared") StoreWord(player + 0x78, 0);
         __imp__sub_82300158(ctx, base);
         StoreWord(player + 0x78, viewState);
     }
