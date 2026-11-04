@@ -68,11 +68,12 @@ void SetCurrentEye(int eye);
 
 // Stereo, renderer thread: a draw with `viewport` into a target of the given
 // size is the game's 2D canvas (HUD, menus, fades) when it covers the whole
-// full-size 16:9 output (the eye views use half-width viewports). Then fills one
+// full-size 16:9 output (the eye views use half-width viewports) and is not a
+// full-screen post-processing quad (identified by its vertex shader). Then fills one
 // viewport and scissor per eye (a centred, aspect-correct panel in each half)
 // and returns true.
 bool HudEyeRects(const plume::RenderViewport& viewport, int32_t targetWidth, int32_t targetHeight, uint32_t guestWidth,
-                 plume::RenderViewport* eyes, plume::RenderRect* scissors);
+                 uint64_t vertexShader, uint64_t pixelShader, plume::RenderViewport* eyes, plume::RenderRect* scissors);
 
 // Present thread: the game's final frame for this present (internal
 // resolution, 8-bit RGBA, before desktop scaling); the VR copy prefers it over

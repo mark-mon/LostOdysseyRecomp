@@ -47,7 +47,7 @@ void SubmitDesktopFrame(plume::RenderTexture*, uint32_t, uint32_t, std::vector<p
 bool AdjustMainView(uint32_t) { return false; }
 void SetFrameSource(plume::RenderTexture*, uint32_t, uint32_t) {}
 bool StereoViewsActive() { return false; }
-bool HudEyeRects(const plume::RenderViewport&, int32_t, int32_t, uint32_t, plume::RenderViewport*, plume::RenderRect*) { return false; }
+bool HudEyeRects(const plume::RenderViewport&, int32_t, int32_t, uint32_t, uint64_t, uint64_t, plume::RenderViewport*, plume::RenderRect*) { return false; }
 void SetCurrentEye(int) {}
 bool Active() { return false; }
 void Shutdown() {}
@@ -610,22 +610,36 @@ bool StereoViewsActive()
 void SetCurrentEye(int eye) { t_eye = eye; }
 
 bool HudEyeRects(const plume::RenderViewport& viewport, int32_t targetWidth, int32_t targetHeight, uint32_t guestWidth,
-                 plume::RenderViewport* eyes, plume::RenderRect* scissors)
+                 uint64_t vertexShader, uint64_t pixelShader, plume::RenderViewport* eyes, plume::RenderRect* scissors)
 {
+    // The game's full-screen post-processing quads (scene copy, tone map, blur)
+    // share one vertex shader; they work on both eye views at once and stay whole.
+    constexpr uint64_t FullScreenQuadVS = 0x8bbd4da701845d16ull;
     // Diagnostics: the first wide draws and why they were (not) taken as HUD.
-    static std::atomic<uint32_t> logged{0};
+    // One line per distinct shader pair and verdict.
+    static std::mutex seenMutex;
+    static std::vector<std::tuple<uint64_t, uint64_t, const char*>> seen;
     const bool wide = viewport.width > float(targetWidth) * 0.6f;
     auto note = [&](const char* verdict) {
-        if (wide && logged.fetch_add(1) < 24)
-            LOG_NOTICE("vr: hud candidate {} viewport ({:.1f},{:.1f} {:.1f}x{:.1f}) target {}x{} guest width {}",
-                verdict, viewport.x, viewport.y, viewport.width, viewport.height, targetWidth, targetHeight, guestWidth);
+        bool first = false;
+        if (wide) {
+            const std::scoped_lock lock(seenMutex);
+            const auto entry = std::make_tuple(vertexShader, pixelShader, verdict);
+            if (seen.size() < 64 && std::find(seen.begin(), seen.end(), entry) == seen.end()) { seen.push_back(entry); first = true; }
+        }
+        if (first)
+            LOG_NOTICE("vr: hud candidate {} vs {:016x} ps {:016x} viewport ({:.1f},{:.1f} {:.1f}x{:.1f}) target {}x{} guest width {}",
+                verdict, vertexShader, pixelShader, viewport.x, viewport.y, viewport.width, viewport.height, targetWidth, targetHeight, guestWidth);
     };
     // Only the guest's full-size output (1280 wide in guest space) carries the HUD.
     if (guestWidth < 1200 || targetWidth <= 0 || targetHeight <= 0) { note("rejected: guest width"); return false; }
+    // The output target is padded (1280x736 for 1280x720), so judge by the
+    // viewport: it starts at the origin, spans the full width and is 16:9.
     if (viewport.x > 0.5f || viewport.y > 0.5f || viewport.width < float(targetWidth) - 1.0f ||
-        viewport.height < float(targetHeight) - 1.0f)
-    { note("rejected: not full target"); return false; }
-    const float aspect = float(targetWidth) / float(targetHeight);
+        viewport.height > float(targetHeight) + 0.5f)
+    { note("rejected: not full width"); return false; }
+    if (vertexShader == FullScreenQuadVS) { note("rejected: full-screen quad"); return false; }
+    const float aspect = viewport.width / viewport.height;
     if (std::abs(aspect - 16.0f / 9.0f) > 0.05f) { note("rejected: aspect"); return false; }
     note("taken");
     // LO_VR_HUD_SCALE: panel width as a fraction of one eye's width (default 0.75).
@@ -634,16 +648,16 @@ bool HudEyeRects(const plume::RenderViewport& viewport, int32_t targetWidth, int
         const float f = v ? float(atof(v)) : 0.0f;
         return f > 0.05f && f <= 1.0f ? f : 0.75f;
     }();
-    const float half = float(targetWidth) * 0.5f;
+    const float half = viewport.width * 0.5f, fullHeight = viewport.height;
     float w = half * scale, h = w / aspect;
-    if (h > float(targetHeight)) { h = float(targetHeight); w = h * aspect; }
+    if (h > fullHeight) { h = fullHeight; w = h * aspect; }
     for (int e = 0; e < 2; ++e) {
         eyes[e] = viewport;
         eyes[e].x = float(e) * half + (half - w) * 0.5f;
-        eyes[e].y = (float(targetHeight) - h) * 0.5f;
+        eyes[e].y = (fullHeight - h) * 0.5f;
         eyes[e].width = w;
         eyes[e].height = h;
-        scissors[e] = plume::RenderRect(int32_t(float(e) * half), 0, int32_t(float(e + 1) * half), targetHeight);
+        scissors[e] = plume::RenderRect(int32_t(float(e) * half), 0, int32_t(float(e + 1) * half), int32_t(fullHeight));
     }
     return true;
 }
@@ -714,7 +728,10 @@ void SubmitDesktopFrame(plume::RenderTexture* image, uint32_t width, uint32_t he
         if (g_source.texture && g_source.frames == s.frames) {
             auto* frame = static_cast<plume::VulkanTexture*>(g_source.texture);
             const VkImageLayout layout = ToVkLayout(frame->textureLayout);
-            if (layout != VK_IMAGE_LAYOUT_UNDEFINED && g_source.width && g_source.height) {
+            // Only when it is larger than the desktop image (an internal resolution
+            // above the window). TODO: a Vulkan device loss was seen once with a
+            // 1280x720 frame source; investigate before relying on this path.
+            if (layout != VK_IMAGE_LAYOUT_UNDEFINED && g_source.width > width && g_source.height > height) {
                 source = frame;
                 sourceLayout = layout;
                 width = g_source.width;

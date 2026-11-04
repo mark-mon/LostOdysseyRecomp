@@ -11951,7 +11951,7 @@ void main()
                 std::array<RenderViewport, 2> hudEyes;
                 std::array<RenderRect, 2> hudScissors;
                 const bool hudPerEye = color && !depthOnlyRaster && vr::StereoViewsActive() &&
-                    vr::HudEyeRects(rasterViewport, attachmentWidth, attachmentHeight, color->guestWidth,
+                    vr::HudEyeRects(rasterViewport, attachmentWidth, attachmentHeight, color->guestWidth, key.vs, key.ps,
                         hudEyes.data(), hudScissors.data());
                 for (uint32_t pass = 0; pass < (hudPerEye ? 2u : 1u); ++pass)
                 {
