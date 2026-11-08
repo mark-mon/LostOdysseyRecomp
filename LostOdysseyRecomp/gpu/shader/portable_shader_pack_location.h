@@ -75,6 +75,10 @@ inline std::vector<std::filesystem::path> CandidatePaths(Flavor flavor) {
         const auto staged = DefaultPath(FormatOf(flavor)).parent_path() / FileNameOf(flavor);
         if (staged.lexically_normal() != paths.front().lexically_normal()) paths.push_back(staged);
     } catch (const std::exception&) {}
+    // A build in a folder inside a recomp install (e.g. Lost Odyssey\VR) uses the install's pack
+    // when it has none of its own: the game's shaders are the same.
+    if (os::user_paths::UsePortableLayout() && !os::user_paths::g_executableDirectory.empty())
+        paths.push_back((os::user_paths::g_executableDirectory / ".." / "shaders" / FileNameOf(flavor)).lexically_normal());
     return paths;
 }
 }

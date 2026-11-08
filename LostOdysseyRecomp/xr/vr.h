@@ -61,8 +61,32 @@ void SubmitDesktopFrame(plume::RenderTexture* image, uint32_t width, uint32_t he
 // the view (the caller then skips its own projection edits).
 bool AdjustMainView(uint32_t view);
 
+// Game thread, once per frame: the scene size VR wants (mono: one eye; stereo: both
+// eyes side by side) at `percent` (per axis) of the headset's recommended per-eye
+// size. False when VR is off, theater, or the headset is unknown: Render
+// resolution applies then.
+bool RenderSize(uint32_t percent, uint32_t& width, uint32_t& height);
+// The runtime's recommended per-eye image size (false before OpenXR starts).
+bool RecommendedEyeSize(uint32_t& width, uint32_t& height);
+
 // Stereo: CalcSceneView is being run once per eye this frame.
 bool StereoViewsActive();
+// Head pose per rendered frame (mono/stereo). AdjustMainView numbers each frame's pose;
+// the game render thread looks the serial up from its FViewInfo (same view matrix) and puts
+// it in the command ring; the GPU thread hands it over with the frame, and the frame is
+// submitted to OpenXR with the pose it was rendered with (no swim when turning the head).
+uint32_t PoseSerialForView(uint32_t view);
+void SetFramePoseSerial(uint32_t serial);
+// Stereo, game render thread, inside a view's post-processing: the game places its full-view
+// quads (DrawDenormalizedQuad) at the view's origin X/Y, in a target it takes to be the view's
+// size or the whole surface; with the viewport the view's own, they belong at 0, 0 of a target
+// the view's size. No change outside VR post-processing or for a view at the origin.
+// `stack` is the caller's stack pointer: its +92/+100 words are the target size the quad is
+// placed in. Returns the original TargetSizeX word to put back at stack + 92 after the
+// call when it was changed, else 0. `ints` (r4..r10) are for the diagnostic log only.
+uint32_t AdjustPostQuad(double& x, double& y, double width, double height,
+                        double& u, double& v, double sizeU, double sizeV,
+                        uint32_t stack, const uint32_t* ints = nullptr);
 // Eye whose FSceneView is being built on this thread (0 left, 1 right, -1 none).
 void SetCurrentEye(int eye);
 
@@ -74,11 +98,43 @@ void SetCurrentEye(int eye);
 // and returns true.
 bool HudEyeRects(const plume::RenderViewport& viewport, int32_t targetWidth, int32_t targetHeight, uint32_t guestWidth,
                  uint64_t vertexShader, uint64_t pixelShader, plume::RenderViewport* eyes, plume::RenderRect* scissors);
+// Stereo with VR → HUD position "Fixed in space": the 2D canvas (HudCanvas: same test as
+// HudEyeRects) is drawn into a layer of its own instead of the eyes, and the headset
+// compositor shows that layer as a flat panel fixed in space (true perspective, no roll).
+bool HudLayerActive();
+bool HudCanvas(const plume::RenderViewport& viewport, int32_t targetWidth, int32_t targetHeight, uint32_t guestWidth,
+               uint64_t vertexShader, uint64_t pixelShader);
+// Renderer, at the present: this frame's HUD layer (null when nothing was drawn into it).
+void SetHudLayerSource(plume::RenderTexture* texture, uint32_t width, uint32_t height);
+// Renderer: the frame the headset gets already holds the game's display gamma ramp and the
+// player's Brightness / Gamma, so desktop presentation must not apply them again.
+void SetDisplayCurveInFrame(bool inFrame);
+// Stereo frames the game builds with its comic-panel views (cutscenes) are rendered flat (one
+// full view, panels composited on top) and shown on a screen in front of you. Their pose serial
+// (gpu/vr_clip.h PoseBegin) carries FlatFrameBit. GPU thread: the frame being processed is one.
+constexpr uint32_t FlatFrameBit = 0x80000000u;
+bool FlatFrame();
+// Game thread (hor_plus.cpp): the game built a comic-panel view (caller 0x82307BEC) this frame.
+void NotePanelView();
+// Game thread (hor_plus.cpp): a movie (FLO_MOVIE) was drawn into the main output this frame.
+// Movies are shown flat the same way, whatever the movie.
+void NoteMovie();
+// Game thread (patches/encounter_defer.cpp): a battle was requested. Its transition (the field
+// picture warped full screen) is shown flat until the battle runs (at most 10 s).
+void NoteBattleRequested();
+// F10 (developer): log the time since the last battle request (measuring the transition).
+void MarkBattleTransition();
+bool DisplayCurveInFrame();
 
 // Present thread: the game's final frame for this present (internal
 // resolution, 8-bit RGBA, before desktop scaling); the VR copy prefers it over
 // the desktop swap chain image. Not used in theater mode.
 void SetFrameSource(plume::RenderTexture* texture, uint32_t width, uint32_t height);
+
+// Present thread: a host menu (Settings, F1 debug menu) is drawn this frame.
+// The headset then shows the finished desktop image (with the menu) on a
+// screen in front of the player instead of the per-eye views.
+void SetHostMenuVisible(bool visible);
 
 // Recenter (F9 or both sticks clicked): the current head yaw and position
 // become forward / origin. Applied on the next VR frame; any thread.

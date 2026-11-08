@@ -1537,8 +1537,9 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
     text(130, 42, 234, 43, Translate(current.language, L"Settings", L"設定"), 31, ink, false);
     text(70, 122, 260, 28, Translate(current.language, L"Menu", L"選單"), 18, ink, false);
 
-    const wchar_t *enTabs[] = {L"Gameplay", L"Audio", L"Graphics", L"System"};
-    const wchar_t *zhTabs[] = {L"遊戲", L"聲音", L"圖像", L"系統"};
+    const wchar_t *enTabs[] = {L"Gameplay", L"Audio", L"Graphics", L"System", L"VR"};
+    const wchar_t *zhTabs[] = {L"遊戲", L"聲音", L"圖像", L"系統", L"VR"};
+    static_assert(std::size(enTabs) == MenuTabCount && std::size(zhTabs) == MenuTabCount);
     if (!current.pageTitle.empty())
     {
         // A page opened from a row: one selected cell in place of the tabs.

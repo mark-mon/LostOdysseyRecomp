@@ -1,5 +1,9 @@
 #include <stdafx.h>
 
+#include <set>
+#include <array>
+#include <bit>
+#include <os/logger.h>
 #include "gpu/renderer.h"
 #include "gpu/movie_clear.h"
 #include "gpu/movie_replace.h"
@@ -177,8 +181,19 @@ void HorPlusViewProjection(PPCRegister& r1, PPCRegister& r31)
 {
     const uint32_t caller = LoadWord(r1.u32 + 0x1D8);
     const auto scale = SceneScale();
+    static const bool viewLog = getenv("LO_VR_VIEW_LOG") != nullptr;
+    if (viewLog) {
+        // Every FSceneView built (caller, rectangle, main-view test), once per distinct combination.
+        static std::set<std::array<uint32_t, 6>> seen;
+        const std::array<uint32_t, 6> key{caller, LoadWord(r31.u32 + 0x1C), LoadWord(r31.u32 + 0x20),
+            LoadWord(r31.u32 + 0x24), LoadWord(r31.u32 + 0x28), uint32_t(IsMainPerspectiveView(r31.u32))};
+        if (seen.size() < 256 && seen.insert(key).second)
+            LOG_NOTICE("vr: scene view caller {:08x} rect ({},{} {}x{}) main {}", caller, std::bit_cast<float>(key[1]),
+                std::bit_cast<float>(key[2]), std::bit_cast<float>(key[3]), std::bit_cast<float>(key[4]), key[5]);
+    }
     if ((caller == 0x82300AFC || caller == 0x82307BEC) && IsMainPerspectiveView(r31.u32))
     {
+        if (caller == 0x82307BEC) vr::NotePanelView();
         // VR replaces the projection with the headset frustum and adds the head pose.
         if (vr::AdjustMainView(r31.u32)) return;
         ScaleProjection(r31.u32 + 0x80, scale);
@@ -416,6 +431,7 @@ PPC_FUNC(sub_8230D6B8)
 PPC_FUNC(sub_823EFC08)
 {
     MovieScope scope(IsMainOutputView(ctx.r6.u32));
+    if (IsMainOutputView(ctx.r6.u32)) vr::NoteMovie();
     gpu::movie_replace::ProxyBegin(LoadWord(ctx.r3.u32 + 116));
     __imp__sub_823EFC08(ctx, base);
     gpu::movie_replace::ProxyEnd();
@@ -426,6 +442,18 @@ PPC_FUNC(sub_823EFC08)
 // calls retain their full-target coverage.
 PPC_FUNC(sub_823E4B50)
 {
+    // VR stereo: post-processing quads of a view off the origin (see vr::AdjustPostQuad).
+    if (vr::StereoViewsActive())
+    {
+        const uint32_t ints[7] = {ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32};
+        const uint32_t stack = ctx.r1.u32;
+        if (const uint32_t restore = vr::AdjustPostQuad(ctx.f1.f64, ctx.f2.f64, ctx.f3.f64, ctx.f4.f64,
+                ctx.f5.f64, ctx.f6.f64, ctx.f7.f64, ctx.f8.f64, stack, ints)) {
+            __imp__sub_823E4B50(ctx, base);
+            *reinterpret_cast<uint32_t*>(base + stack + 92) = __builtin_bswap32(restore);
+            return;
+        }
+    }
     const bool movie = movieMainOutput && uint32_t(ctx.lr) == 0x823EFF88;
     // The outer movie call receives its device in r4, but its 0x823EFF00
     // caller moves that value to r3 immediately before this helper.

@@ -71,6 +71,7 @@ inline bool Required(const Config &before, const Config &after)
     // changes in place and keeps the swap chain.
     return before.gameLanguage != after.gameLanguage || before.gameLanguagePack != after.gameLanguagePack ||
            before.graphicsBackend != after.graphicsBackend ||
+           before.vrMode != after.vrMode ||
            before.gpuDevice != after.gpuDevice ||
            (before.hdr != after.hdr &&
             (before.frameGenerationProvider != framegen::Provider::Off ||

@@ -1063,6 +1063,8 @@ namespace gpu::video
         // sessions, reconciliation and status always see the same request.
         [[maybe_unused]] framegen::EnvironmentSelection VulkanFgRequest()
         {
+            // VR mono/stereo: the headset takes the game's own frames, never generated ones.
+            if (vr::RequestedMode() == vr::Mode::Mono || vr::RequestedMode() == vr::Mode::Stereo) return {};
             return frame_generation::ResolveVulkanSelection(settings::GetConfig(), std::getenv("LO_FG_PROVIDER"),
                 std::getenv("LO_FG_MODE"), std::getenv("LO_FG_MULTIPLIER"),
                 std::getenv("LO_FG_TARGET_FPS"), std::getenv("LO_DLSS_FG"));
@@ -3796,6 +3798,9 @@ namespace gpu::video
             if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F9 &&
                 vr::RequestedMode() != vr::Mode::Off)
                 vr::RequestRecenter();
+            if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F10 &&
+                vr::RequestedMode() != vr::Mode::Off)
+                vr::MarkBattleTransition();
             if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F1)
             {
                 LOG_INFO("[host_ui] F1 key triggered!");
@@ -5044,7 +5049,8 @@ namespace gpu::video
                     options.calibrationScene = g_hdrCalibrationCache.scene;
                     options.calibrationSceneExtended = g_hdrCalibrationCache.extended;
                     options.calibrationExpandRgbRange = brightness.expandRgbRange;
-                    options.calibrationDisplayGammaRamp = true;
+                    // VR: the cached scene already holds the game's ramp (vr::DisplayCurveInFrame).
+                    options.calibrationDisplayGammaRamp = !vr::DisplayCurveInFrame();
                 }
             }
 #if defined(_WIN32) && defined(LO_GPU_PLUME) && !defined(LO_VIDEO_SUBMISSION_UNIT)
@@ -5224,6 +5230,12 @@ namespace gpu::video
         presentationOptions.displayAdjust = true;
         presentationOptions.displayBrightness = presentationConfig.displayBrightness;
         presentationOptions.displayGamma = presentationConfig.displayGamma;
+        // VR mono/stereo: the renderer already put both into the frame (for the headset).
+        if (vr::DisplayCurveInFrame()) {
+            presentationOptions.displayGammaRamp = false;
+            presentationOptions.displayBrightness = 0;
+            presentationOptions.displayGamma = 100;
+        }
         // Debug / test trigger: auto-open overlay after N frames if LO_AUTO_OVERLAY is set
         static int s_autoOverlayCountdown = []() {
             const char* env = getenv("LO_AUTO_OVERLAY");
@@ -5241,6 +5253,7 @@ namespace gpu::video
 
         const bool hasSettings = settings::DrawMenu(g_menuPixels, g_menuRevision, menuWidth, menuHeight);
         const bool hasDebug = debug_menu::IsOverlayVisible();
+        if (g_vulkan && vr::RequestedMode() != vr::Mode::Off) vr::SetHostMenuVisible(hasSettings || hasDebug);
         // In a game, Settings goes over this frame (DrawSettingsOverlay), which
         // keeps the retail header. Frame generation presents frames of its own,
         // so with it the menu still replaces the frame.
@@ -5675,6 +5688,7 @@ namespace gpu::video
 
         const bool hasSettings = settings::DrawMenu(g_menuPixels, g_menuRevision, menuWidth, menuHeight);
         const bool hasDebug = debug_menu::IsOverlayVisible();
+        if (g_vulkan && vr::RequestedMode() != vr::Mode::Off) vr::SetHostMenuVisible(hasSettings || hasDebug);
         if (!hasSettings && !hasDebug)
             return;
 

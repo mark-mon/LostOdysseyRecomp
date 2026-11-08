@@ -41,6 +41,11 @@ inline constexpr uint32_t TargetGuestHeight(TargetRole role, uint32_t height) {
 // taller ones keep its width and grow taller, so that area keeps its pixels.
 // A minimized/uninitialized output uses the native size, never a zero allocation.
 inline constexpr uint32_t MaxTallHeight = 4320; // bounds portrait rasters
+// An explicit internal size (VR: the headset's per-eye size, both eyes side by
+// side) as a mode value: bit 31 set, width in bits 16..30, height in bits 0..15.
+inline constexpr uint32_t ExplicitSizeMode(uint32_t width, uint32_t height) {
+    return 0x80000000u | ((std::min)(width, 16384u) << 16) | (std::min)(height, 16384u);
+}
 inline constexpr Size ResolveInternalSize(uint32_t mode, uint32_t outputWidth, uint32_t outputHeight) {
     const bool hasOutput = outputWidth && outputHeight;
     const bool tall = hasOutput && uint64_t(outputWidth) * 9 < uint64_t(outputHeight) * 16;
@@ -55,6 +60,10 @@ inline constexpr Size ResolveInternalSize(uint32_t mode, uint32_t outputWidth, u
         if (!hasOutput) return {uint32_t((uint64_t(height) * 16) / 9), height};
         return tall ? forWidth(uint32_t((uint64_t(height) * 16) / 9)) : Size{widthForHeight(height), height};
     };
+    if (mode & 0x80000000u) {
+        const uint32_t width = (mode >> 16) & 0x7FFFu, height = mode & 0xFFFFu;
+        if (width && height) return {width, height};
+    }
     switch (mode) {
     case 720: case 1080: case 1440: case 2160: return forMode(mode);
     default:

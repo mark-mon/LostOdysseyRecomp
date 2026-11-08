@@ -41,6 +41,9 @@ namespace gpu::renderer
     // allocation consumes this immutable plan instead of the window size.
     void SelectFramePlan(const frame_plan::FramePlan& plan);
     void RegisterCatalogSurface(frame_plan::SurfaceRole role, uint32_t surfaceInfo, uint32_t colorInfo);
+    // Ordered host-private VR command (gpu/vr_clip.h): the guest rectangle that later draws and
+    // resolve clears are confined to; right <= left turns it off.
+    void SetVrClip(int32_t left, int32_t top, int32_t right, int32_t bottom);
     // Ordered host-private movie command, consumed on the command processor
     // thread after the movie helper has drawn its safe-area destination.
     void ClearMovieBars(uint32_t surfaceInfo, uint32_t colorInfo,

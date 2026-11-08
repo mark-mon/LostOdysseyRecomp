@@ -3,6 +3,7 @@
 #include <os/platform.h>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 
 #ifdef _WIN32
@@ -142,8 +143,28 @@ namespace os::user_paths
             UsePortableLayout() ? std::filesystem::path("profile") : DataDir() / "profile");
     }
 
+    // save-path.txt beside the executable (portable layout), only when it exists: its first line names
+    // the save folder, relative to the executable's folder or absolute (e.g. "..\save" for a VR folder
+    // inside a recomp install, sharing the install's saves). LO_SAVE_DIR still wins.
+    inline std::filesystem::path SavePathFromFile()
+    {
+        if (!UsePortableLayout() || ExecutableDir().empty()) return {};
+        std::ifstream file(ExecutableDir() / "save-path.txt", std::ios::binary);
+        std::string line;
+        if (!file || !std::getline(file, line)) return {};
+        if (line.size() >= 3 && uint8_t(line[0]) == 0xEF && uint8_t(line[1]) == 0xBB && uint8_t(line[2]) == 0xBF) line.erase(0, 3);
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
+        while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) line.erase(0, 1);
+        if (line.empty()) return {};
+        const std::filesystem::path path(std::u8string(line.begin(), line.end()));
+        return (path.is_absolute() ? path : ExecutableDir() / path).lexically_normal();
+    }
+    inline bool SavePathFileUsed() { return std::getenv("LO_SAVE_DIR") == nullptr && !SavePathFromFile().empty(); }
+
     inline std::filesystem::path SaveDir()
     {
+        if (const auto fromFile = SavePathFromFile(); !fromFile.empty())
+            return detail::EnvironmentPath("LO_SAVE_DIR", fromFile);
         return detail::EnvironmentPath("LO_SAVE_DIR",
             (UsePortableLayout() ? std::filesystem::current_path() : DataDir()) / "save");
     }

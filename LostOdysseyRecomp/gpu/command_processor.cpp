@@ -2,6 +2,8 @@
 #include "command_processor.h"
 #include "movie_clear.h"
 #include "movie_replace.h"
+#include "vr_clip.h"
+#include "xr/vr.h"
 #include "frame_plan.h"
 #include "display_gamma.h"
 #include "video.h"
@@ -458,6 +460,31 @@ namespace gpu
                         std::bit_cast<float>(m_movieClear.safeLeft), std::bit_cast<float>(m_movieClear.safeRight),
                         std::bit_cast<float>(m_movieClear.safeTop), std::bit_cast<float>(m_movieClear.safeBottom));
                 m_movieClear = {};
+                break;
+            }
+            return;
+        }
+        if (index == vr_clip::PoseBegin || index == vr_clip::PoseSerial)
+        {
+            static bool active = false;
+            if (index == vr_clip::PoseBegin) active = value == vr_clip::Magic;
+            else if (active) { vr::SetFramePoseSerial(value); active = false; }
+            return;
+        }
+        if (index >= vr_clip::RegisterBase && index <= vr_clip::Commit)
+        {
+            static uint32_t clip[4] = {};
+            static bool active = false;
+            switch (index)
+            {
+            case vr_clip::Begin: active = value == vr_clip::Magic; break;
+            case vr_clip::Left: case vr_clip::Top: case vr_clip::Right: case vr_clip::Bottom:
+                if (active) clip[index - vr_clip::Left] = value;
+                break;
+            case vr_clip::Commit:
+                if (active && value == vr_clip::Magic)
+                    renderer::SetVrClip(int32_t(clip[0]), int32_t(clip[1]), int32_t(clip[2]), int32_t(clip[3]));
+                active = false;
                 break;
             }
             return;

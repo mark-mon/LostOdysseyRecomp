@@ -275,6 +275,8 @@ void FileSystem::Init(const std::filesystem::path& gameRoot)
     g_discIdentity = DiscSet::ReadIdentity(gameRoot);
     const auto dataRoot = os::user_paths::UsePortableLayout() ? std::filesystem::current_path() : os::user_paths::DataDir();
     g_saveRoot = os::user_paths::SaveDir();
+    if (os::user_paths::SavePathFileUsed())
+        LOG_NOTICE("saves: {} (from save-path.txt)", FileSystem::PathUtf8(g_saveRoot));
 #if LO_PLATFORM_ANDROID || defined(LO_STORAGE_TESTING)
     const char* sharedSaves = std::getenv("LO_SAVE_SHARED");
     g_sharedSaves = sharedSaves && std::strcmp(sharedSaves, "1") == 0;

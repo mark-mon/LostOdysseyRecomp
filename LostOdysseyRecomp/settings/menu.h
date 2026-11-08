@@ -124,7 +124,7 @@ void PointerDrag(float x, float y, bool held);
 //   the game folder to measure the game's own fonts).
 // Input, help text, pointer hits and the tests use these constants, never
 // literal row numbers.
-inline constexpr int MenuTabCount = 4;
+inline constexpr int MenuTabCount = 5;
 // Gameplay tab (0).
 inline constexpr int GameRetailRowCount = 7;
 inline constexpr int GameControlsRow = 7; // opens the Controls page
@@ -154,6 +154,18 @@ inline constexpr int SystemShaderBundleRow = 10; // downloads the shader bundle 
 inline constexpr int SystemShaderPreparationRow = 11; // requests startup pipeline preparation
 inline constexpr int SystemSaveRow = 12;
 inline constexpr int SystemRowCount = 13;
+// VR tab (4): OpenXR headset output.
+inline constexpr int VrModeRow = 0;        // applied after restart
+inline constexpr int VrResolutionRow = 1;  // mono/stereo
+inline constexpr int VrHudSizeRow = 2;     // stereo
+inline constexpr int VrHudDistanceRow = 3; // stereo
+inline constexpr int VrHudAnchorRow = 4;   // stereo
+inline constexpr int VrSharpenRow = 5;     // mono/stereo
+inline constexpr int VrWorldScaleRow = 6;  // mono/stereo
+inline constexpr int VrHorizonRow = 7;     // mono/stereo
+inline constexpr int VrRecenterRow = 8;    // while a VR session runs
+inline constexpr int VrSaveRow = 9;
+inline constexpr int VrRowCount = 10;
 static_assert(GameControlsRow == GameRetailRowCount && GameMainMenuRow + 1 == GameRowCount);
 static_assert(AudioRearAngleRow + 1 == AudioRowCount && SystemSaveRow + 1 == SystemRowCount);
 // Logical ids for the graphics tab (2). MenuSnapshot::row stores these as int.

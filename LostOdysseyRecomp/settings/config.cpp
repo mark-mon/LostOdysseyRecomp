@@ -53,6 +53,13 @@ Config Validate(Config value)
         value.anisotropicFiltering != 8 && value.anisotropicFiltering != 16) value.anisotropicFiltering = 0;
     value.depthOfFieldPercent = std::min(value.depthOfFieldPercent, 100u);
     value.cullingPercent = std::min(value.cullingPercent, 200u);
+    if (value.vrMode > 3) value.vrMode = 0;
+    value.vrHudDegrees = std::clamp(value.vrHudDegrees, 16u, 80u);
+    value.vrHudDistanceCm = std::clamp(value.vrHudDistanceCm, 50u, 500u);
+    value.vrWorldScale = std::clamp(value.vrWorldScale, 10u, 200u);
+    value.vrResolutionPercent = std::clamp(value.vrResolutionPercent, 30u, 300u);
+    value.vrHudAnchor = std::min(value.vrHudAnchor, 1u);
+    value.vrSharpen = std::min(value.vrSharpen, 500u) / 25 * 25;
     value.vibrationPercent = std::min(value.vibrationPercent, 100u);
     value.audioMatrixRear = std::clamp((value.audioMatrixRear + 5) / 10 * 10, 90u, 150u);
     value.voiceVolume = std::min(value.voiceVolume, 100u);
@@ -238,6 +245,22 @@ Config Read()
             value.dynamicShadows = number;
         else if (key == "culling")
             value.cullingPercent = number;
+        else if (key == "vr_mode")
+            value.vrMode = number;
+        else if (key == "vr_hud_degrees")
+            value.vrHudDegrees = number;
+        else if (key == "vr_hud_distance_cm")
+            value.vrHudDistanceCm = number;
+        else if (key == "vr_world_scale")
+            value.vrWorldScale = number;
+        else if (key == "vr_resolution_percent")
+            value.vrResolutionPercent = number;
+        else if (key == "vr_level_horizon" && number <= 1)
+            value.vrLevelHorizon = number == 1;
+        else if (key == "vr_hud_anchor")
+            value.vrHudAnchor = number;
+        else if (key == "vr_sharpen")
+            value.vrSharpen = number;
         else if (key == "vibration")
             value.vibrationPercent = number;
         else if (key == "button_prompts")
@@ -481,6 +504,14 @@ static bool WriteConfig(const Config &value)
            << "\nscene_fades=" << (value.sceneFades ? 1 : 0)
            << "\ndynamic_shadows=" << value.dynamicShadows
            << "\nculling=" << value.cullingPercent
+           << "\nvr_mode=" << value.vrMode
+           << "\nvr_hud_degrees=" << value.vrHudDegrees
+           << "\nvr_hud_distance_cm=" << value.vrHudDistanceCm
+           << "\nvr_world_scale=" << value.vrWorldScale
+           << "\nvr_level_horizon=" << (value.vrLevelHorizon ? 1 : 0)
+           << "\nvr_resolution_percent=" << value.vrResolutionPercent
+           << "\nvr_hud_anchor=" << value.vrHudAnchor
+           << "\nvr_sharpen=" << value.vrSharpen
            << "\nvibration=" << value.vibrationPercent
            << "\nbutton_prompts=" << value.buttonPrompts
            << "\ncontroller_map=" << hid::input_map::FormatController(value.controllerMap)

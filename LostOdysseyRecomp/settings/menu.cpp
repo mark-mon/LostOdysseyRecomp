@@ -25,6 +25,7 @@
 #include <apu/audio.h>
 #include <updater/shader_pack_download.h>
 #include <hid/hid.h>
+#include <xr/vr.h>
 #include <hid/glyph_atlases.h>
 #if !LO_PLATFORM_ANDROID && !defined(__SWITCH__) && !defined(__NX__) && (defined(_WIN32) || defined(__linux__) || defined(__APPLE__))
 #include <discord/presence.h>
@@ -1165,6 +1166,18 @@ std::wstring DlssNotice()
         AppendSentence(text, BackendPendingSentence(running.device.backend));
     return text;
 }
+// The VR tab's settings (saved from that tab only).
+void CopyVrSettings(Config& to, const Config& from)
+{
+    to.vrMode = from.vrMode;
+    to.vrResolutionPercent = from.vrResolutionPercent;
+    to.vrHudDegrees = from.vrHudDegrees;
+    to.vrHudDistanceCm = from.vrHudDistanceCm;
+    to.vrWorldScale = from.vrWorldScale;
+    to.vrLevelHorizon = from.vrLevelHorizon;
+    to.vrHudAnchor = from.vrHudAnchor;
+    to.vrSharpen = from.vrSharpen;
+}
 bool SystemRowHidden(int r)
 {
 #if LO_PLATFORM_ANDROID || defined(__SWITCH__) || defined(__NX__) || !(defined(_WIN32) || defined(__linux__) || defined(__APPLE__))
@@ -1172,6 +1185,39 @@ bool SystemRowHidden(int r)
 #else
     return false;
 #endif
+}
+// VR tab: the detail rows show with the modes they apply to; HUD rows only matter in stereo.
+bool VrRowHidden(int r)
+{
+#if LO_PLATFORM_MACOS || LO_PLATFORM_ANDROID
+    // OpenXR output is desktop Windows/Linux only.
+    if (r != VrSaveRow) return true;
+#endif
+    if (r == VrHudSizeRow || r == VrHudDistanceRow || r == VrHudAnchorRow) return edit.vrMode != 3;
+    if (r == VrResolutionRow || r == VrWorldScaleRow || r == VrHorizonRow || r == VrSharpenRow) return edit.vrMode < 2;
+    if (r == VrRecenterRow) return !vr::Active();
+    return false;
+}
+// VR mono/stereo (this run): rows that do not reach the headset image are shown dimmed and
+// locked. The headset takes the game's own frame before desktop presentation, so upscalers,
+// frame generation, presentation filters and HDR output only affect the desktop
+// mirror; VR resolution replaces Render resolution. (Brightness / Gamma is applied to the
+// headset frame by the renderer.)
+bool VrGraphicsRowLocked(int r)
+{
+    const vr::Mode mode = vr::RequestedMode();
+    if (mode != vr::Mode::Mono && mode != vr::Mode::Stereo) return false;
+    switch (GraphicsRow(r)) {
+    case GraphicsRow::RenderResolution: case GraphicsRow::AntiAliasing: case GraphicsRow::DlssQuality:
+    case GraphicsRow::DlssModel: case GraphicsRow::FsrSharpness: case GraphicsRow::DlssNeuralRendering:
+    case GraphicsRow::NeuralRenderingTuning: case GraphicsRow::FrameGeneration:
+    case GraphicsRow::FrameGenerationMultiplier: case GraphicsRow::ScalingQuality: case GraphicsRow::RgbRange:
+    case GraphicsRow::Hdr: case GraphicsRow::HdrPaperWhite: case GraphicsRow::HdrPeak:
+    case GraphicsRow::HdrCalibration:
+        return true;
+    default:
+        return false;
+    }
 }
 bool GraphicsRowHidden(int r)
 {
@@ -1462,6 +1508,7 @@ void Publish(uint8_t *base, uint32_t config)
         next.rows.resize(int(GraphicsRow::Count));
         auto placeGraphics = [&](GraphicsRow id, Row value) {
             value.hidden = GraphicsRowHidden(int(id));
+            if (VrGraphicsRowLocked(int(id))) value.enabled = false;
             next.rows[int(id)] = std::move(value);
         };
 #ifdef _WIN32
@@ -1648,6 +1695,48 @@ void Publish(uint8_t *base, uint32_t config)
         placeGraphics(GraphicsRow::Brightness, std::move(brightness));
         placeGraphics(GraphicsRow::Save, makeChoices(L"Save graphics settings", L"儲存圖形設定", {Tr(L"Save", L"儲存")}, 0));
     }
+    else if (tab == 4)
+    {
+        // VR (OpenXR). Mode applies after a restart; the rest as soon as they are saved.
+        addChoices(L"VR mode", L"VR 模式",
+            {Tr(L"Off", L"關"), Tr(L"Theater", L"劇院"), Tr(L"Mono", L"單眼"), Tr(L"Stereo", L"立體")},
+            std::min(edit.vrMode, 3u));
+        {
+            // Per-axis percentage of the headset's recommended per-eye size, with the pixels it gives.
+            uint32_t eyeWidth = 0, eyeHeight = 0;
+            const bool known = vr::RecommendedEyeSize(eyeWidth, eyeHeight);
+            std::vector<std::wstring> sizes;
+            for (uint32_t percent = 30; percent <= 300; percent += 10)
+                sizes.push_back(std::to_wstring(percent) + L"%" + (known
+                    ? L"  (" + std::to_wstring((eyeWidth * percent + 50) / 100 & ~1u) + L" × " +
+                      std::to_wstring((eyeHeight * percent + 50) / 100 & ~1u) + Tr(L" per eye)", L" 每眼）")
+                    : std::wstring{}));
+            addChoices(L"VR resolution", L"VR 解析度", std::move(sizes),
+                (std::clamp(edit.vrResolutionPercent, 30u, 300u) - 30) / 10);
+        }
+        std::vector<std::wstring> hudSizes;
+        for (uint32_t degrees = 16; degrees <= 80; degrees += 4) hudSizes.push_back(std::to_wstring(degrees) + L"°");
+        addChoices(L"HUD size", L"HUD 大小", std::move(hudSizes), (std::clamp(edit.vrHudDegrees, 16u, 80u) - 16) / 4);
+        std::vector<std::wstring> distances;
+        for (uint32_t cm = 50; cm <= 500; cm += 25)
+            distances.push_back(std::to_wstring(cm / 100) + L"." + (cm % 100 < 10 ? L"0" : L"") + std::to_wstring(cm % 100) + L" m");
+        addChoices(L"HUD distance", L"HUD 距離", std::move(distances), (std::clamp(edit.vrHudDistanceCm, 50u, 500u) - 50) / 25);
+        addChoices(L"HUD position", L"HUD 位置",
+            {Tr(L"Follows your head", L"跟隨頭部"), Tr(L"Fixed in space", L"固定於空間")}, std::min(edit.vrHudAnchor, 1u));
+        std::vector<std::wstring> sharpness;
+        for (uint32_t s = 0; s <= 500; s += 25)
+            sharpness.push_back(s == 0 ? Tr(L"Off", L"關閉")
+                : std::to_wstring(s / 100) + L"." + (s % 100 < 10 ? L"0" : L"") + std::to_wstring(s % 100));
+        addChoices(L"Sharpening", L"銳化", std::move(sharpness), std::min(edit.vrSharpen, 500u) / 25);
+        std::vector<std::wstring> scales;
+        for (uint32_t scale = 10; scale <= 200; scale += 10) scales.push_back(std::to_wstring(scale));
+        addChoices(L"World scale", L"世界比例", std::move(scales), (std::clamp(edit.vrWorldScale, 10u, 200u) - 10) / 10);
+        addChoices(L"Horizon", L"地平線",
+            {Tr(L"Level", L"水平"), Tr(L"Follow game camera", L"跟隨遊戲鏡頭")}, edit.vrLevelHorizon ? 0 : 1);
+        addAction(L"Recenter view", L"重新置中", Tr(L"Recenter", L"置中"));
+        addAction(L"Save VR settings", L"儲存 VR 設定", Tr(L"Save", L"儲存"));
+        for (int i = 0; i < VrRowCount; ++i) next.rows[i].hidden = VrRowHidden(i);
+    }
     else
     {
         std::vector<std::wstring> uiLanguages(std::begin(UiLanguageNames), std::end(UiLanguageNames));
@@ -1736,6 +1825,33 @@ void Publish(uint8_t *base, uint32_t config)
     if (tab == 3 && row == SystemShaderPreparationRow)
         next.help = Tr(L"Prepares shaders before play at the next start. Reuses the bundle and cache.",
                        L"下次啟動時在遊玩前準備著色器，並重用著色器包與快取。");
+    if (tab == 4 && status.empty())
+    {
+        if (row == VrModeRow)
+            next.help = Tr(L"Play in a headset through OpenXR (SteamVR or another runtime running). Theater: a screen in front of you; Mono: head tracking; Stereo: each eye rendered. Applies after restart.",
+                           L"透過 OpenXR 在頭戴裝置中遊玩（需執行 SteamVR 等）。劇院：面前的螢幕；單眼：頭部追蹤；立體：分別繪製雙眼。重新啟動後套用。");
+        if (row == VrResolutionRow)
+            next.help = Tr(L"Render size per eye, as a share of the headset's recommended size (SteamVR's own resolution setting included). Replaces Render resolution. Applies after saving.",
+                           L"每眼渲染大小，相對於頭戴裝置建議大小（含 SteamVR 解析度設定）。取代渲染解析度。儲存後套用。");
+        if (row == VrHudSizeRow)
+            next.help = Tr(L"Width of the HUD panel in front of you, in degrees. Applies after saving.", L"面前 HUD 面板的寬度（度）。儲存後套用。");
+        if (row == VrHudDistanceRow)
+            next.help = Tr(L"How far away the HUD panel appears. Applies after saving.", L"HUD 面板顯示的距離。儲存後套用。");
+        if (row == VrHudAnchorRow)
+            next.help = Tr(L"Follows your head: the HUD stays in front of you wherever you look. Fixed in space: it stays where Recenter puts it, straight ahead. Applies after saving.",
+                           L"跟隨頭部：HUD 始終在視線前方。固定於空間：HUD 停留在重新置中時的正前方。儲存後套用。");
+        if (row == VrSharpenRow)
+            next.help = Tr(L"LumaSharpen on the headset image (0 off, up to 5.0). Sharpens detail without changing colours. Applies after saving.",
+                           L"對頭戴裝置畫面套用 LumaSharpen（0 關閉，最高 5.0）。銳化細節而不改變色彩。儲存後套用。");
+        if (row == VrWorldScaleRow)
+            next.help = Tr(L"How far the camera moves when you move your head (game units per metre). Higher feels smaller. Applies after saving.",
+                           L"移動頭部時鏡頭移動的距離（每公尺的遊戲單位）。數值越高，世界感覺越小。儲存後套用。");
+        if (row == VrHorizonRow)
+            next.help = Tr(L"Level keeps the horizon flat and lets the headset alone look up and down. Follow game camera keeps the game's camera tilt. Applies after saving.",
+                           L"水平：保持地平線水平，僅由頭戴裝置上下觀看。跟隨遊戲鏡頭：保留遊戲鏡頭傾斜。儲存後套用。");
+        if (row == VrRecenterRow)
+            next.help = Tr(L"Makes the way you face now forward. Also F9, or click both sticks.", L"以目前面向為正前方。也可按 F9 或同時按下兩個搖桿。");
+    }
     if (tab == 1 && row == AudioVoiceVolumeRow && status.empty())
         next.help = Tr(L"Cutscene dialogue volume. Voices in battle follow Sound effects. Applies from the next scene.",
                        L"過場動畫中的對白音量。戰鬥中的語音跟隨音效音量。從下一個場景起套用。");
@@ -1760,7 +1876,13 @@ void Publish(uint8_t *base, uint32_t config)
                  L"測試聲音會繞著喇叭轉圈。設定後方聲道的位置；110° 為 Pro Logic II 標準。")
             : Tr(L"Select Matrix surround in Audio output to adjust this.",
                  L"在音訊輸出選擇矩陣環繞聲後才能調整。");
-    if (tab == 2)
+    if (tab == 2 && VrGraphicsRowLocked(row))
+        next.help = GraphicsRow(row) == GraphicsRow::RenderResolution
+            ? Tr(L"Not used in VR: VR -> VR resolution sets the headset's render size.",
+                 L"VR 中不使用：請在 VR -> VR 解析度設定頭戴裝置的渲染大小。")
+            : Tr(L"Not used in VR: the headset shows the game's own image, so this only affects the desktop window (upscalers and frame generation are off).",
+                 L"VR 中不使用：頭戴裝置顯示遊戲本身的影像，此項只影響桌面視窗（超解析度與影格生成關閉）。");
+    else if (tab == 2)
     {
         switch (GraphicsRow(row))
         {
@@ -3225,7 +3347,9 @@ PPC_FUNC(sub_822F19B0)
         // swap chain, already runs in this process (even with FG now Off).
         const bool hdrNeedsRestart = edit.hdr != previousDisplay.hdr &&
             running.sessionProvider != framegen::Provider::Off;
-        if (restart::Required(previousDisplay, edit) || restartForFgProvider || hdrNeedsRestart)
+        Config savedGraphics = edit;
+        CopyVrSettings(savedGraphics, previousDisplay);  // unsaved VR tab edits do not ask for a restart here
+        if (restart::Required(previousDisplay, savedGraphics) || restartForFgProvider || hdrNeedsRestart)
         {
             restartPrompt = savedRestartPrompt = true;
             restartSaveFailed = false;
@@ -3563,12 +3687,14 @@ PPC_FUNC(sub_822F19B0)
         row = 0;
         status.clear();
     }
-    const int count = tab == 0 ? GameRowCount : tab == 1 ? AudioRowCount : tab == 2 ? int(GraphicsRow::Count) : SystemRowCount;
+    const int count = tab == 0 ? GameRowCount : tab == 1 ? AudioRowCount : tab == 2 ? int(GraphicsRow::Count) :
+                      tab == 4 ? VrRowCount : SystemRowCount;
     // Provider-specific rows keep their logical ids and navigation skips them
     // when unavailable. Keyboard Enter reaches the menu as GAMEPAD_START
     // (hid.cpp), so one branch covers gamepad Start and Enter.
     auto rowHidden = [&](int r) {
-        return (tab == 2 && GraphicsRowHidden(r)) || (tab == 3 && SystemRowHidden(r)) || TitleModeHidden(tab, r);
+        return (tab == 2 && GraphicsRowHidden(r)) || (tab == 3 && SystemRowHidden(r)) || (tab == 4 && VrRowHidden(r)) ||
+               TitleModeHidden(tab, r);
     };
     if (input & 1)
         do { row = (row + count - 1) % count; } while (rowHidden(row));
@@ -3576,7 +3702,7 @@ PPC_FUNC(sub_822F19B0)
         do { row = (row + 1) % count; } while (rowHidden(row));
     if (input & 0x10)
     {
-        const int saveRow = tab == 2 ? int(GraphicsRow::Save) : tab == 3 ? SystemSaveRow : -1;
+        const int saveRow = tab == 2 ? int(GraphicsRow::Save) : tab == 3 ? SystemSaveRow : tab == 4 ? VrSaveRow : -1;
         // Start / Enter shifts focus to Save; inhibit confirm on the same tick so
         // simultaneous input (or key bindings sending both) cannot save from another
         // row. Pressed again on Save it saves, so keyboard Enter confirms like A.
@@ -3594,6 +3720,8 @@ PPC_FUNC(sub_822F19B0)
         } else { collectionPrompt = true; collectionChoice = 1; }
         Publish(base, config); return;
     }
+    // Locked in VR: neither Left/Right nor A changes or opens it.
+    if (tab == 2 && VrGraphicsRowLocked(row)) input &= ~uint16_t(0x1000 | 4 | 8);
     // A confirms actions/dialogs only. Option values change with Left/Right.
     const int delta = (input & 4) ? -1 : (input & 8) ? 1 : 0;
     auto cycle = [&](uint32_t value, uint32_t count) {
@@ -3881,6 +4009,22 @@ PPC_FUNC(sub_822F19B0)
                 break;
             }
         }
+        else if (tab == 4)
+        {
+            if (row == VrModeRow) edit.vrMode = cycle(std::min(edit.vrMode, 3u), 4);
+            if (row == VrResolutionRow)
+                edit.vrResolutionPercent = uint32_t(std::clamp(int(std::clamp(edit.vrResolutionPercent, 30u, 300u)) + delta * 10, 30, 300));
+            if (row == VrHudSizeRow)
+                edit.vrHudDegrees = uint32_t(std::clamp(int(std::clamp(edit.vrHudDegrees, 16u, 80u)) + delta * 4, 16, 80));
+            if (row == VrHudDistanceRow)
+                edit.vrHudDistanceCm = uint32_t(std::clamp(int(std::clamp(edit.vrHudDistanceCm, 50u, 500u)) + delta * 25, 50, 500));
+            if (row == VrWorldScaleRow)
+                edit.vrWorldScale = uint32_t(std::clamp(int(std::clamp(edit.vrWorldScale, 10u, 200u)) + delta * 10, 10, 200));
+            if (row == VrHorizonRow) edit.vrLevelHorizon = !edit.vrLevelHorizon;
+            if (row == VrHudAnchorRow) edit.vrHudAnchor = edit.vrHudAnchor ? 0u : 1u;
+            if (row == VrSharpenRow)
+                edit.vrSharpen = uint32_t(std::clamp(int(std::min(edit.vrSharpen, 500u)) + delta * 25, 0, 500));
+        }
         else
         {
             if (row == SystemUiLanguageRow)
@@ -4001,6 +4145,7 @@ PPC_FUNC(sub_822F19B0)
         graphics.gameLanguagePack = previousDisplay.gameLanguagePack;
         graphics.automaticUpdates = previousDisplay.automaticUpdates;
         graphics.debugLog = previousDisplay.debugLog;
+        CopyVrSettings(graphics, previousDisplay);  // saved from the VR tab
         if (graphics.frameGenerationProvider == framegen::Provider::Fsr || graphics.frameGenerationProvider == framegen::Provider::MetalFx)
             graphics.frameGenerationMultiplier = 2;
         if (!SaveConfig(graphics))
@@ -4014,6 +4159,7 @@ PPC_FUNC(sub_822F19B0)
             graphics.automaticUpdates = edit.automaticUpdates;
             graphics.discordStatus = edit.discordStatus;
             graphics.debugLog = edit.debugLog;
+            CopyVrSettings(graphics, edit);
             edit = graphics;
             if (edit.width != previousDisplay.width || edit.height != previousDisplay.height ||
                 edit.windowMode != previousDisplay.windowMode || edit.displayName != previousDisplay.displayName ||
@@ -4027,6 +4173,29 @@ PPC_FUNC(sub_822F19B0)
         }
         Publish(base, config);
         return;
+    }
+    if ((input & 0x1000) && tab == 4 && row == VrRecenterRow && !VrRowHidden(row))
+    {
+        vr::RequestRecenter();
+        status = Tr(L"View recentered.", L"已重新置中。");
+    }
+    if ((input & 0x1000) && tab == 4 && row == VrSaveRow)
+    {
+        Config vrConfig = GetConfig();
+        CopyVrSettings(vrConfig, edit);
+        const Config before = GetConfig();
+        if (restart::Required(before, vrConfig))
+        {
+            restartPrompt = true;
+            savedRestartPrompt = false;
+            restartSaveFailed = false;
+            restartForFgProvider = false;
+            restartChoice = 0;
+            restartAfter = vrConfig;
+        }
+        else
+            status = SaveConfig(vrConfig) ? Tr(L"VR settings saved.", L"VR 設定已儲存。")
+                                          : Tr(L"Could not save settings.", L"無法儲存設定。");
     }
     if ((input & 0x1000) && tab == 3 && row == SystemSaveRow)
     {

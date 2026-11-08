@@ -6,6 +6,7 @@
 #include "gpu/video.h"
 #include <string_view>
 #include "settings/config.h"
+#include "xr/vr.h"
 #include "kernel/memory.h"
 #include "cpu/ppc_context.h"
 
@@ -105,6 +106,9 @@ namespace gpu::frame_plan
     upscaling::OutputRegion PlannedOutputRegion(resolution::Size drawableSize, const settings::Config& config)
     {
         const auto output = upscaling::ResolveOutputRegion(drawableSize, config.aspectRatio);
+        uint32_t vrWidth = 0, vrHeight = 0;
+        // VR renders at the headset's size without an upscaler (see BeginCpuFrame).
+        if (vr::RenderSize(config.vrResolutionPercent, vrWidth, vrHeight)) return output;
         return config.upscaler == upscaling::Upscaler::Off ? output :
             upscaling::SupersampledOutputRegion(output, PlannedInternalResolution(config));
     }
@@ -113,13 +117,21 @@ namespace gpu::frame_plan
     {
         const uint64_t extent = drawable.load(std::memory_order_acquire);
         auto config = settings::GetConfig();
+        // VR mono/stereo: the scene targets take the headset's per-eye size (stereo: both eyes side by
+        // side) instead of Render resolution, and temporal upscalers stay off (they reject two views).
+        uint32_t vrWidth = 0, vrHeight = 0;
+        const bool vrSize = vr::RenderSize(config.vrResolutionPercent, vrWidth, vrHeight);
+        if (vrSize) config.upscaler = upscaling::Upscaler::Off;
+        // Camera TAA reprojects one view; the headset frame holds two (and takes no presentation AA).
+        if (vrSize && config.antialiasing == 3) config.antialiasing = 2;
         static const bool readback = getenv("LO_RESOLVE_READBACK") != nullptr;
         static const bool dlssInputProbe = [] { const char* value = getenv("LO_DLSS_INPUT_PROBE"); return value && std::string_view(value) == "1"; }();
         const resolution::Size drawableSize{uint32_t(extent >> 32), uint32_t(extent)};
         // The resolve-readback path renders the native raster and never supersamples.
         const auto output = readback ? upscaling::ResolveOutputRegion(drawableSize, config.aspectRatio) :
             PlannedOutputRegion(drawableSize, config);
-        config.internalResolution = int(PlannedInternalResolution(config));
+        config.internalResolution = vrSize ? int(resolution::ExplicitSizeMode(vrWidth, vrHeight))
+                                           : int(PlannedInternalResolution(config));
         narrowTallView.store(aspect_ratio::NarrowsView(config.aspectRatio), std::memory_order_relaxed);
         const auto device = video::BackendDeviceState();
         std::optional<upscaling::OutputSizing> sizing;

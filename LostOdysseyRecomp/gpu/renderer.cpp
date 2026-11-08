@@ -1,6 +1,7 @@
 #include <source_location>
 #include "taa_binding_evidence.h"
 #include "xr/vr.h"
+#include "display_gamma.h"
 #include "scene_aa_provenance.h"
 #include "scene_copy_promotion_policy.h"
 #include "scene_copy_promotion_shaders.h"
@@ -473,6 +474,18 @@ namespace gpu::renderer
             bool shadowMap = false;
             uint32_t ScaleX(uint32_t value) const { return resolution::ScaleX(value, resolutionSize.width); }
             uint32_t ScaleY(uint32_t value) const { return resolution::Scale(value, resolutionSize.height); }
+            // EDRAM tile ownership (partial transfers, VR stereo): the guest rectangle this
+            // colour target wrote since it last exchanged ownership with ownerPartner.
+            bool ownerDirtyAll = true;
+            int32_t ownerDirty[4] = {0, 0, 0, 0};  // left, top, right, bottom; empty when right <= left
+            uint64_t ownerPartner = 0;
+            void MarkOwnerDirty(int32_t left, int32_t top, int32_t right, int32_t bottom)
+            {
+                if (right <= left || bottom <= top || ownerDirtyAll) return;
+                if (ownerDirty[2] <= ownerDirty[0]) { ownerDirty[0] = left; ownerDirty[1] = top; ownerDirty[2] = right; ownerDirty[3] = bottom; return; }
+                ownerDirty[0] = std::min(ownerDirty[0], left); ownerDirty[1] = std::min(ownerDirty[1], top);
+                ownerDirty[2] = std::max(ownerDirty[2], right); ownerDirty[3] = std::max(ownerDirty[3], bottom);
+            }
             uint32_t depthMsaa = 0;
             // Guest-memory footprint with sampled and full hashes of it, so a
             // texture the title streams in after we first uploaded it is re-read.
@@ -2422,6 +2435,24 @@ namespace gpu::renderer
                 fsrCapturePages.push_back(evaluatePage);
             }
 
+            // Developer probe (LO_TONE_PROBE=1): tone-map draws (PS b4b4d54a7a2d6b96) per frame as they
+            // enter Draw (stage 0) and when they are recorded (stage 1, with the guest viewport x).
+            void ToneProbe(int stage, uint64_t ps, float viewportX = 0.0f)
+            {
+                static const bool enabled = [] { const char* v = getenv("LO_TONE_PROBE"); return v && v[0] == '1'; }();
+                if (!enabled) return;
+                static uint64_t probeFrame = ~0ull;
+                static uint32_t entered = 0, recorded = 0, logged = 0;
+                static std::string xs;
+                if (frame != probeFrame) {
+                    if (probeFrame != ~0ull && (entered || recorded) && (logged++ < 40 || (probeFrame % 300) == 0))
+                        LOG_NOTICE("renderer: tone probe f{} entered={} recorded={} x=[{}]", probeFrame, entered, recorded, xs);
+                    probeFrame = frame; entered = recorded = 0; xs.clear();
+                }
+                if (ps != 0xb4b4d54a7a2d6b96ull) return;
+                if (stage == 0) ++entered;
+                else { ++recorded; xs += fmt::format("{:g} ", viewportX); }
+            }
             uint32_t TraceFrame() const
             {
                 static const uint32_t configured = getenv("LO_DRAW_TRACE") ? strtoul(getenv("LO_DRAW_TRACE"), nullptr, 10) : 0;
@@ -2977,6 +3008,228 @@ namespace gpu::renderer
             std::unique_ptr<RenderShader> bloomPrefilterPs;
             std::unique_ptr<RenderPipeline> bloomPrefilterPipeline;
 
+            // VR: LumaSharpen (CeeJay.dk's SweetFX, MIT) on the final frame before it goes to the
+            // headset. Strength in xeTransfer.x, the luma clamp in xeTransfer.y.
+            std::unique_ptr<RenderShader> sharpenPs;
+            std::map<uint32_t, std::unique_ptr<RenderPipeline>> sharpenPipelines;
+            std::unique_ptr<HostTexture> sharpenScratch;
+
+            // VR HUD position "Fixed in space" (vr::HudLayerActive): the game's 2D canvas draws go
+            // into this 16:9 layer instead of the eyes; the present hands it to OpenXR as a quad layer.
+            std::unique_ptr<HostTexture> vrHudLayer;
+            // VR stereo: for each EDRAM colour surface (base | format << 16), where a later view's
+            // post-processing last resolved its own rectangle of it (dest base, dest format). The
+            // menu backdrop takes the other eye's picture from there (one frame old).
+            // The first such resolve of a frame is the eye's scene; later ones are post-processing
+            // steps written back into the same surface.
+            struct LaterViewResolve { uint32_t destBase = 0, destFormat = 0; uint64_t frame = 0; };
+            std::unordered_map<uint32_t, LaterViewResolve> vrLaterViewResolves;
+            bool vrHudDrawn = false, vrHudNeedsClear = true;
+            HostTexture* AcquireVrHudLayer(RenderFormat format)
+            {
+                constexpr uint32_t width = 1920, height = 1080;
+                if (vrHudLayer && vrHudLayer->texture && vrHudLayer->format == format) return vrHudLayer.get();
+                if (vrHudLayer) Gpu().retiredTextures.push_back(std::move(vrHudLayer));
+                vrHudLayer = std::make_unique<HostTexture>();
+                vrHudLayer->allocationSerial = ++nextTargetAllocation;
+                vrHudLayer->format = format;
+                vrHudLayer->width = width;
+                vrHudLayer->height = height;
+                vrHudLayer->guestWidth = 1280;
+                vrHudLayer->guestHeight = 720;
+                vrHudLayer->texture = device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, format,
+                    RenderTextureFlag::RENDER_TARGET));
+                vrHudLayer->layout = RenderTextureLayout::UNKNOWN;
+                vrHudNeedsClear = true;
+                if (!vrHudLayer->texture) { vrHudLayer.reset(); return nullptr; }
+                return vrHudLayer.get();
+            }
+
+            void CompileSharpenShader()
+            {
+                const char* src =
+                    "Texture2D<float4> src : register(t0, space1);\n"
+                    "#ifdef __spirv__\n"
+                    "struct XePushConstants { uint64_t vs; uint64_t sharedAddress; uint64_t ps; };\n"
+                    "[[vk::push_constant]] ConstantBuffer<XePushConstants> xePush;\n"
+                    "#define xeTransfer vk::RawBufferLoad<uint4>(xePush.sharedAddress + 240)\n"
+                    "#else\n"
+                    "cbuffer XeShared : register(b1, space0) {\n"
+                    "  uint4 pad0[2]; uint4 pad1[8]; float4 pad2; float4 pad3; float4 pad4;\n"
+                    "  float4 pad5; float4 xeColorMax; uint4 xeTransfer;\n"
+                    "};\n"
+                    "#endif\n"
+                    "float4 main(float4 pos : SV_Position) : SV_Target\n"
+                    "{\n"
+                    "    uint w, h; src.GetDimensions(w, h);\n"
+                    "    const int2 p = int2(pos.xy), hi = int2(w, h) - 1;\n"
+                    "    const float4 ori = src.Load(int3(p, 0));\n"
+                    "    // Mode 2: per-channel 256-entry curve in the ps constants (VR: guest gamma ramp + brightness/gamma).\n"
+                    "    if (xeTransfer.z == 2) {\n"
+                    "#ifdef __spirv__\n"
+                    "        const float3 f = saturate(ori.rgb) * 255.0;\n"
+                    "        const uint3 i = min(uint3(f), 254u);\n"
+                    "        const float3 t = f - float3(i);\n"
+                    "        const float3 lo = float3(vk::RawBufferLoad<float4>(xePush.ps + i.r * 16).r, vk::RawBufferLoad<float4>(xePush.ps + i.g * 16).g, vk::RawBufferLoad<float4>(xePush.ps + i.b * 16).b);\n"
+                    "        const float3 hi = float3(vk::RawBufferLoad<float4>(xePush.ps + i.r * 16 + 16).r, vk::RawBufferLoad<float4>(xePush.ps + i.g * 16 + 16).g, vk::RawBufferLoad<float4>(xePush.ps + i.b * 16 + 16).b);\n"
+                    "        return float4(lerp(lo, hi, t), ori.a);\n"
+                    "#else\n"
+                    "        return ori;\n"
+                    "#endif\n"
+                    "    }\n"
+                    "    // Mode 1: gamma-encode a linear picture (VR menu backdrop's other eye).\n"
+                    "    if (xeTransfer.z == 1) return float4(pow(saturate(ori.rgb), asfloat(xeTransfer.w)), ori.a);\n"
+                    "    const float strength = asfloat(xeTransfer.x), sharpClamp = asfloat(xeTransfer.y);\n"
+                    "    // 3x3 Gaussian (LumaSharpen pattern 2 at whole pixels).\n"
+                    "    float3 blur = ori.rgb * 0.25;\n"
+                    "    blur += (src.Load(int3(clamp(p + int2(-1, 0), 0, hi), 0)).rgb + src.Load(int3(clamp(p + int2(1, 0), 0, hi), 0)).rgb +\n"
+                    "             src.Load(int3(clamp(p + int2(0, -1), 0, hi), 0)).rgb + src.Load(int3(clamp(p + int2(0, 1), 0, hi), 0)).rgb) * 0.125;\n"
+                    "    blur += (src.Load(int3(clamp(p + int2(-1, -1), 0, hi), 0)).rgb + src.Load(int3(clamp(p + int2(1, -1), 0, hi), 0)).rgb +\n"
+                    "             src.Load(int3(clamp(p + int2(-1, 1), 0, hi), 0)).rgb + src.Load(int3(clamp(p + int2(1, 1), 0, hi), 0)).rgb) * 0.0625;\n"
+                    "    const float3 sharp = ori.rgb - blur;\n"
+                    "    const float3 lumaStrength = float3(0.2126, 0.7152, 0.0722) * strength;\n"
+                    "    const float4 lumaClamp = float4(lumaStrength * (0.5 / sharpClamp), 0.5);\n"
+                    "    float sharpLuma = saturate(dot(float4(sharp, 1.0), lumaClamp));\n"
+                    "    sharpLuma = (sharpClamp * 2.0) * sharpLuma - sharpClamp;\n"
+                    "    return float4(ori.rgb + sharpLuma, ori.a);\n"
+                    "}\n";
+                xenos::CompiledShader f = xenos::CompileCachedHlsl(src, "main", "ps_6_0", binaryFormat);
+                if (!f.ok) { SHADER_LOG_WARNING("compile-failed", None, "renderer: sharpen shader compilation failed: {}", f.errors); return; }
+                sharpenPs = device->createShader(f.bytecode.data(), f.bytecode.size(), "main", renderFormat);
+            }
+
+            RenderPipeline* GetSharpenPipeline(const HostTexture& tex)
+            {
+                if (!sharpenPs || !blitVs) return nullptr;
+                RenderPipeline* pipeline = nullptr;
+                if (auto it = sharpenPipelines.find(uint32_t(tex.format)); it != sharpenPipelines.end()) pipeline = it->second.get();
+                else {
+                    RenderGraphicsPipelineDesc desc;
+                    desc.pipelineLayout = pipelineLayout.get();
+                    desc.vertexShader = blitVs.get();
+                    desc.pixelShader = sharpenPs.get();
+                    desc.depthEnabled = false;
+                    desc.depthWriteEnabled = false;
+                    desc.depthFunction = RenderComparisonFunction::ALWAYS;
+                    desc.depthTargetFormat = RenderFormat::UNKNOWN;
+                    desc.renderTargetFormat[0] = tex.format;
+                    desc.renderTargetBlend[0] = RenderBlendDesc::Copy();
+                    desc.renderTargetCount = 1;
+                    desc.renderTargetBlend[0].renderTargetWriteMask = 0xF;
+                    desc.cullMode = RenderCullMode::NONE;
+                    desc.primitiveTopology = RenderPrimitiveTopology::TRIANGLE_LIST;
+                    auto created = device->createGraphicsPipeline(desc);
+                    pipeline = created.get();
+                    sharpenPipelines.emplace(uint32_t(tex.format), std::move(created));
+                }
+                return pipeline;
+            }
+
+            // Writes pow(source, exponent) into `dest` over the rectangle (same pixel positions).
+            bool GammaCopyRegion(HostTexture& source, HostTexture& dest, uint32_t x, uint32_t y, uint32_t w, uint32_t h, float exponent)
+            {
+                RenderPipeline* pipeline = source.texture && dest.texture ? GetSharpenPipeline(dest) : nullptr;
+                if (!pipeline) return false;
+                SharedConstants constants{};
+                constants.transfer[2] = 1;
+                constants.transfer[3] = std::bit_cast<uint32_t>(exponent);
+                const uint64_t offset = Upload(&constants, sizeof(constants));
+                if (offset == UINT64_MAX || !Begin()) return false;
+                Transition(source, RenderTextureLayout::SHADER_READ, RenderBarrierStage::GRAPHICS);
+                Transition(dest, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
+                RenderDescriptorSet* set1 = AcquireSet(1);
+                set1->setTexture(0, source.texture.get(), RenderTextureLayout::SHADER_READ);
+                BindTargets(&dest, nullptr);
+                RenderViewport viewport(0.0f, 0.0f, float(dest.width), float(dest.height));
+                commandList->setViewports(&viewport, 1);
+                RenderRect rect{int32_t(x), int32_t(y), int32_t(x + w), int32_t(y + h)};
+                commandList->setScissors(&rect, 1);
+                commandList->setPipeline(pipeline);
+                commandList->setGraphicsPipelineLayout(pipelineLayout.get());
+                SetConstantBuffer(offset, 0);
+                SetConstantBuffer(offset, 1);
+                SetConstantBuffer(offset, 2);
+                commandList->setGraphicsDescriptorSet(staticSet0.get(), 0);
+                commandList->setGraphicsDescriptorSet(set1, 1);
+                commandList->setGraphicsDescriptorSet(AcquireSet(2), 2);
+                commandList->setGraphicsDescriptorSet(AcquireSet(3), 3);
+                if (vulkan) commandList->setGraphicsDescriptorSet(staticSamplerSet.get(), 4);
+                commandList->drawInstanced(3, 1, 0, 0);
+                return true;
+            }
+
+            // Sharpens `tex` in place (through a scratch target). False when it could not.
+            bool SharpenInPlace(HostTexture& tex, float strength)
+            {
+                if (strength <= 0.0f) return false;
+                SharedConstants constants{};
+                constants.transfer[0] = std::bit_cast<uint32_t>(std::min(strength, 5.0f));
+                constants.transfer[1] = std::bit_cast<uint32_t>(0.035f);
+                return FilterInPlace(tex, constants, nullptr, 0);
+            }
+
+            // Applies `curve` (256 RGB entries, 0..1 output per 8-bit input) in place (Vulkan only).
+            bool CurveInPlace(HostTexture& tex, const float (&curve)[256][4])
+            {
+                if (!vulkan) return false;
+                SharedConstants constants{};
+                constants.transfer[2] = 2;
+                return FilterInPlace(tex, constants, curve, sizeof(curve));
+            }
+
+            // Runs the sharpen shader (mode from constants.transfer) over `tex` through a scratch target.
+            bool FilterInPlace(HostTexture& tex, const SharedConstants& constants, const void* psData, size_t psSize)
+            {
+                if (!tex.texture) return false;
+                RenderPipeline* pipeline = GetSharpenPipeline(tex);
+                if (!pipeline) return false;
+                if (!sharpenScratch || !sharpenScratch->texture || sharpenScratch->width != tex.width ||
+                    sharpenScratch->height != tex.height || sharpenScratch->format != tex.format) {
+                    if (sharpenScratch) Gpu().retiredTextures.push_back(std::move(sharpenScratch));
+                    sharpenScratch = std::make_unique<HostTexture>();
+                    sharpenScratch->allocationSerial = ++nextTargetAllocation;
+                    sharpenScratch->format = tex.format;
+                    sharpenScratch->width = tex.width;
+                    sharpenScratch->height = tex.height;
+                    sharpenScratch->guestWidth = tex.guestWidth;
+                    sharpenScratch->guestHeight = tex.guestHeight;
+                    sharpenScratch->resolutionSize = tex.resolutionSize;
+                    sharpenScratch->texture = device->createTexture(RenderTextureDesc::Texture2D(tex.width, tex.height, 1, tex.format,
+                        RenderTextureFlag::RENDER_TARGET));
+                    sharpenScratch->layout = RenderTextureLayout::UNKNOWN;
+                    if (!sharpenScratch->texture) { sharpenScratch.reset(); return false; }
+                }
+                const uint64_t offset = Upload(&constants, sizeof(constants));
+                const uint64_t psOffset = psData ? Upload(psData, psSize) : offset;
+                if (offset == UINT64_MAX || psOffset == UINT64_MAX || !Begin()) return false;
+                HostTexture& scratch = *sharpenScratch;
+                Transition(tex, RenderTextureLayout::SHADER_READ, RenderBarrierStage::GRAPHICS);
+                Transition(scratch, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
+                RenderDescriptorSet* set1 = AcquireSet(1);
+                set1->setTexture(0, tex.texture.get(), RenderTextureLayout::SHADER_READ);
+                BindTargets(&scratch, nullptr);
+                RenderViewport viewport(0.0f, 0.0f, float(tex.width), float(tex.height));
+                commandList->setViewports(&viewport, 1);
+                RenderRect rect{0, 0, int32_t(tex.width), int32_t(tex.height)};
+                commandList->setScissors(&rect, 1);
+                commandList->setPipeline(pipeline);
+                commandList->setGraphicsPipelineLayout(pipelineLayout.get());
+                SetConstantBuffer(offset, 0);
+                SetConstantBuffer(offset, 1);
+                SetConstantBuffer(psOffset, 2);
+                commandList->setGraphicsDescriptorSet(staticSet0.get(), 0);
+                commandList->setGraphicsDescriptorSet(set1, 1);
+                commandList->setGraphicsDescriptorSet(AcquireSet(2), 2);
+                commandList->setGraphicsDescriptorSet(AcquireSet(3), 3);
+                if (vulkan) commandList->setGraphicsDescriptorSet(staticSamplerSet.get(), 4);
+                commandList->drawInstanced(3, 1, 0, 0);
+                Transition(scratch, RenderTextureLayout::COPY_SOURCE, RenderBarrierStage::COPY);
+                Transition(tex, RenderTextureLayout::COPY_DEST, RenderBarrierStage::COPY);
+                commandList->copyTextureRegion(RenderTextureCopyLocation::Subresource(tex.texture.get()),
+                    RenderTextureCopyLocation::Subresource(scratch.texture.get()), 0, 0, 0, nullptr);
+                return true;
+            }
+
             // Reinterprets one EDRAM class as another: pack the source value into the
             // guest's 32-bit word, then unpack it the way the new class reads it.
             std::unique_ptr<RenderShader> transferPs;
@@ -3033,7 +3286,8 @@ namespace gpu::renderer
                 return result;
             }
 
-            void TransferRegion(HostTexture& src, HostTexture& dst, uint32_t srcClass, uint32_t dstClass)
+            void TransferRegion(HostTexture& src, HostTexture& dst, uint32_t srcClass, uint32_t dstClass,
+                                const int32_t* guestRect = nullptr)
             {
                 FlushMotionReplayQueue();
                 dst.sdrProducerFrame = ~0ull;
@@ -3050,7 +3304,7 @@ namespace gpu::renderer
                 // everywhere, so the transfer would write one value too: owe that as
                 // a clear of the destination region instead of drawing. The source
                 // keeps its own clear.
-                if (src.pendingClear.Size() == 1 && src.format == RenderFormat::R16G16B16A16_FLOAT &&
+                if (!guestRect && src.pendingClear.Size() == 1 && src.format == RenderFormat::R16G16B16A16_FLOAT &&
                     dst.format == RenderFormat::R16G16B16A16_FLOAT)
                 {
                     const pending_clear::Op& owed = src.pendingClear.Ops()[0];
@@ -3086,11 +3340,19 @@ namespace gpu::renderer
                 set1->setTexture(0, src.texture.get(), RenderTextureLayout::SHADER_READ);
                 // A transfer over the whole target (copy blend, all channels)
                 // replaces every pixel, so clears it still owes are dead.
-                if (w == dst.width && h == dst.height) dst.pendingClear.Drop();
+                if (!guestRect && w == dst.width && h == dst.height) dst.pendingClear.Drop();
+                RenderRect scissor{ 0, 0, int32_t(w), int32_t(h) };
+                if (guestRect) {
+                    // Only the tiles the old owner wrote change hands.
+                    scissor = RenderRect(std::min(int32_t(dst.ScaleX(uint32_t(std::max(guestRect[0], 0)))), int32_t(w)),
+                                         std::min(int32_t(dst.ScaleY(uint32_t(std::max(guestRect[1], 0)))), int32_t(h)),
+                                         std::min(int32_t(dst.ScaleX(uint32_t(std::max(guestRect[2], 0)))), int32_t(w)),
+                                         std::min(int32_t(dst.ScaleY(uint32_t(std::max(guestRect[3], 0)))), int32_t(h)));
+                    if (scissor.right <= scissor.left || scissor.bottom <= scissor.top) return;
+                }
                 BindTargets(&dst, nullptr);
                 RenderViewport viewport(0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h));
                 commandList->setViewports(&viewport, 1);
-                RenderRect scissor{ 0, 0, int32_t(w), int32_t(h) };
                 commandList->setScissors(&scissor, 1);
                 commandList->setPipeline(pipeline);
                 commandList->setGraphicsPipelineLayout(pipelineLayout.get());
@@ -3109,6 +3371,9 @@ namespace gpu::renderer
                 transfers++;
             }
             uint32_t transfers = 0;
+            // VR stereo (gpu/vr_clip.h): guest rectangle of the view whose post-processing is being
+            // drawn; draws and resolve clears stay inside it. Empty (right <= left) when off.
+            RenderRect vrClip{0, 0, 0, 0};
 
             void CompileBlitShaders()
             {
@@ -3133,6 +3398,7 @@ namespace gpu::renderer
                 }
                 blitVs = device->createShader(v.bytecode.data(), v.bytecode.size(), "main", renderFormat);
                 blitPs = device->createShader(f.bytecode.data(), f.bytecode.size(), "main", renderFormat);
+                CompileSharpenShader();
                 if (bloomPrefilterEnabled || getenv("LO_TAA_DIAGNOSTIC_REQUEST")) {
                     auto bloom = xenos::CompileCachedHlsl(bloom_prefilter::PixelShader, "main", "ps_6_0", binaryFormat);
                     if (bloom.ok)
@@ -7923,7 +8189,22 @@ void main()
                     if (prev != renderTargets.end() && prev->second && prev->second->texture && target && target->texture) {
                         // The transfer reads the old owner and may cover only part of the new one.
                         if (prev->second.get() == restoreDebt.target || target == restoreDebt.target) SettleRestoreDebt();
-                        TransferRegion(*prev->second, *target, owner->second, colorClass);
+                        // VR stereo: both eyes share one surface and switch formats per eye (one eye's LDR
+                        // tone map, then the other eye's HDR passes). Like the real EDRAM, only the tiles
+                        // the old owner wrote since the last exchange change hands; converting the whole
+                        // surface fed the other eye's stale image into this one (false colours).
+                        HostTexture& source = *prev->second;
+                        static const bool partialEnabled = [] { const char* v = getenv("LO_EDRAM_PARTIAL_TRANSFER"); return !v || v[0] != '0'; }();
+                        const bool partial = partialEnabled && vr::StereoViewsActive() && !source.ownerDirtyAll &&
+                            source.ownerPartner == target->allocationSerial && target->ownerPartner == source.allocationSerial;
+                        if (!partial)
+                            TransferRegion(source, *target, owner->second, colorClass);
+                        else if (source.ownerDirty[2] > source.ownerDirty[0])
+                            TransferRegion(source, *target, owner->second, colorClass, source.ownerDirty);
+                        source.ownerPartner = target->allocationSerial;
+                        target->ownerPartner = source.allocationSerial;
+                        target->ownerDirtyAll = false;
+                        target->ownerDirty[0] = target->ownerDirty[1] = target->ownerDirty[2] = target->ownerDirty[3] = 0;
                     }
                 }
                 owner->second = colorClass;
@@ -9712,10 +9993,19 @@ void main()
                 // Pipeline.
                 PipelineKey key{};
                 float layerDepthOffset = 0.0f;
+                auto toneCheck = [&](int point) {
+                    static const bool enabled = [] { const char* v = getenv("LO_TONE_PROBE"); return v && v[0] == '1'; }();
+                    static std::atomic<uint32_t> logged{0};
+                    if (enabled && key.ps == 0xb4b4d54a7a2d6b96ull && logged.fetch_add(1, std::memory_order_relaxed) < 80)
+                        LOG_NOTICE("renderer: tone check f{} point {} vp.x={:g}", frame, point,
+                            RegF(REG_PA_CL_VPORT_XSCALE + 1) - std::fabs(RegF(REG_PA_CL_VPORT_XSCALE)));
+                };
                 {
                     render_batch::CpuTimer<> pipelineLookupTimer(cpuTimingEnabled);
                     key.vs = vsHash;
                 key.ps = ps ? psHash : 0;
+                ToneProbe(0, key.ps);
+                toneCheck(1);
                 key.blend = Reg(REG_RB_BLENDCONTROL0);
                 key.depthControl = depthControl;
                 key.stencilRefMask = Reg(REG_RB_STENCILREFMASK) & 0xFFFFFF;
@@ -10035,6 +10325,7 @@ void main()
                         if (motionReplay) {motionReplay->EnableGpuTiming(gpuTiming);motionReplay->BeginFrame(frame, temporalEpoch);}
                     }
                 }
+                toneCheck(2);
                 taaInit.AddTo(tTaa);
                 std::optional<temporal::SceneResolve> temporalSceneCopy;
                 std::optional<temporal::TemporalFrameInputs> dlssSceneCopyInputs;
@@ -10051,6 +10342,7 @@ void main()
                 } retainAo{this,sceneAo};
                 std::optional<temporal::SceneAnchor> temporalDrawAnchor;
 
+                toneCheck(3);
                 SharedConstants shared{};
                 if (vulkan) shared.vertexArenaAddress = vertexArena->getDeviceAddress();
                 // One call per run of registers instead of one per word (same values).
@@ -10064,6 +10356,26 @@ void main()
                 float xs = RegF(REG_PA_CL_VPORT_XSCALE), xo = RegF(REG_PA_CL_VPORT_XSCALE + 1);
                 float ys = RegF(REG_PA_CL_VPORT_XSCALE + 2), yo = RegF(REG_PA_CL_VPORT_XSCALE + 3);
                 float zs = RegF(REG_PA_CL_VPORT_XSCALE + 4), zo = RegF(REG_PA_CL_VPORT_XSCALE + 5);
+                // VR stereo: the post-processing that sets its scissor as (X, Y, SizeX, SizeY) (see the
+                // scissor fix below) sets its viewport the same way, as min (X, Y) and max (SizeX, SizeY).
+                // For the right eye (X = SizeX = 640) that is a zero-width viewport and its tone map drew
+                // nothing. Where the scissor shows that mistake on an axis, rebuild that axis as origin + size.
+                // (vr_stereo.cpp corrects the guest call itself; this catches any pass it does not cover.)
+                {
+                    static const bool viewportFix = [] { const char* v = getenv("LO_VR_SCISSOR_FIX"); return !v || v[0] != '0'; }();
+                    if (viewportFix && (vte & 1) && vr::StereoViewsActive()) {
+                        const int32_t l = int32_t(scissorTl & 0x3FFF), t = int32_t((scissorTl >> 16) & 0x3FFF);
+                        const int32_t r = int32_t(scissorBr & 0x3FFF), b = int32_t((scissorBr >> 16) & 0x3FFF);
+                        if (l > 0 && r <= l) {
+                            const float origin = xo - std::fabs(xs), size = xo + std::fabs(xs);
+                            xs = std::copysign(size * 0.5f, xs == 0.0f ? 1.0f : xs); xo = origin + size * 0.5f;
+                        }
+                        if (t > 0 && b <= t) {
+                            const float origin = yo - std::fabs(ys), size = yo + std::fabs(ys);
+                            ys = std::copysign(size * 0.5f, ys == 0.0f ? -1.0f : ys); yo = origin + size * 0.5f;
+                        }
+                    }
+                }
                 RenderViewport viewport(0.0f, 0.0f, float(rasterTarget->guestWidth), float(rasterTarget->guestHeight));
                 shared.ndcScale[0] = shared.ndcScale[1] = shared.ndcScale[2] = 1.0f;
                 if (vte & 1) // viewport scale enabled: vertices are in NDC, use a real viewport
@@ -10365,6 +10677,7 @@ void main()
                 uint32_t textureSwapSlots = 0;
                 textureBindings[0].fill(dummyTexture2D.texture.get());
                 textureBindings[1].fill(dummyTexture3D.texture.get());
+                toneCheck(4);
                 textureBindings[2].fill(dummyTextureCube.texture.get());
                 render_batch::CpuTimer<> tVertex0(cpuTimingEnabled);
                 bool slot95Bound = false;
@@ -10565,6 +10878,7 @@ void main()
                 };
                 std::optional<AlphaPostDepthInput> alphaPostDepth;
 #endif
+                toneCheck(5);
                 auto bindTextures = [&](Shader* s)
                 {
                     if (!s) return;
@@ -11250,6 +11564,7 @@ void main()
                         }
                     }
                 };
+                toneCheck(6);
                 bindTextures(ps);
                 if (failedPlan)
                     return;
@@ -11257,6 +11572,7 @@ void main()
                 if (failedPlan)
                     return;
 #if defined(LO_GPU_PLUME)
+                toneCheck(7);
                 if (fsrAlphaBridge) for (const auto& request : alphaBridgeFetches) {
                     auto* bound = textureBindings[request.bank][request.slot];
                     const bool unchanged = bound == request.returnedColor;
@@ -11558,6 +11874,19 @@ void main()
                     sample->depth = depth != nullptr;
                 }
                 RenderRect scissor(int32_t(scissorTl & 0x3FFF), int32_t((scissorTl >> 16) & 0x3FFF), int32_t(scissorBr & 0x3FFF), int32_t((scissorBr >> 16) & 0x3FFF));
+                // VR stereo: the game's post-processing sets its scissor from the view rectangle as
+                // (X, Y, SizeX, SizeY) instead of (min, max). That only works for a view at the origin,
+                // which is all the game ever renders; the right eye (X=640) got an empty scissor and its
+                // tone map was dropped (raw HDR shown as false colours). Read such an empty rectangle as
+                // origin + size. LO_VR_SCISSOR_FIX=0 turns this off.
+                {
+                    static const bool scissorFix = [] { const char* v = getenv("LO_VR_SCISSOR_FIX"); return !v || v[0] != '0'; }();
+                    if (scissorFix && (scissor.left > 0 || scissor.top > 0) &&
+                        (scissor.right <= scissor.left || scissor.bottom <= scissor.top) && vr::StereoViewsActive()) {
+                        if (scissor.right <= scissor.left) scissor.right = scissor.left + scissor.right;
+                        if (scissor.bottom <= scissor.top) scissor.bottom = scissor.top + scissor.bottom;
+                    }
+                }
                 uint32_t windowOffset = Reg(REG_PA_SC_WINDOW_OFFSET);
                 if (!(scissorTl & 0x80000000u) && windowOffset)
                 {
@@ -11566,7 +11895,20 @@ void main()
                 }
                 scissor.left = std::clamp(scissor.left, 0, int32_t(rasterTarget->guestWidth)); scissor.right = std::clamp(scissor.right, 0, int32_t(rasterTarget->guestWidth));
                 scissor.top = std::clamp(scissor.top, 0, int32_t(rasterTarget->guestHeight)); scissor.bottom = std::clamp(scissor.bottom, 0, int32_t(rasterTarget->guestHeight));
+                toneCheck(8);
+                if (vrClip.right > vrClip.left) {
+                    scissor.left = std::max(scissor.left, vrClip.left); scissor.top = std::max(scissor.top, vrClip.top);
+                    scissor.right = std::min(scissor.right, vrClip.right); scissor.bottom = std::min(scissor.bottom, vrClip.bottom);
+                    if (scissor.right <= scissor.left || scissor.bottom <= scissor.top) return;  // outside this view
+                }
                 const RenderRect guestScissor = scissor;
+                if (color && key.colorMask) {
+                    const int32_t left = std::max(scissor.left, int32_t(std::floor(viewport.x)));
+                    const int32_t top = std::max(scissor.top, int32_t(std::floor(viewport.y)));
+                    const int32_t right = std::min(scissor.right, int32_t(std::ceil(viewport.x + viewport.width)));
+                    const int32_t bottom = std::min(scissor.bottom, int32_t(std::ceil(viewport.y + viewport.height)));
+                    color->MarkOwnerDirty(left, top, right, bottom);
+                }
                 bool scenePromotionActivated = false;
                 recordProbe.Enter(record_timing::Phase::Promote);
                 if (dlssSrRequested && dlssSceneCopyInputs && fullSceneCopy && !depth
@@ -11617,6 +11959,7 @@ void main()
                 // Height is a historical EDRAM allocation estimate. Attachments
                 // may have different padding while covering the same draw; keep
                 // that draw and constrain it to their common physical extent.
+                toneCheck(9);
                 const int32_t attachmentWidth = int32_t(depthOnlyRaster ? depth->width : depth ? std::min(color->width, depth->width) : color->width);
                 const int32_t attachmentHeight = int32_t(depthOnlyRaster ? depth->height : depth ? std::min(color->height, depth->height) : color->height);
                 // Clamp in registers and store the rectangle once. Reloading four
@@ -11624,11 +11967,44 @@ void main()
                 // store-forwarded and stalled every draw.
                 scissor = RenderRect(std::min(scissorLeft, attachmentWidth), std::min(scissorTop, attachmentHeight),
                     std::min(scissorRight, attachmentWidth), std::min(scissorBottom, attachmentHeight));
+                // VR stereo: the right eye's post-processing (tone map) binds a depth surface that
+                // only covers one eye, so clamping to the common extent emptied its scissor and the
+                // right eye was never tone-mapped (its HDR bits showed as false colours). Draw it
+                // into the colour target alone, without the depth test, instead of dropping it.
+                if ((scissor.right <= scissor.left || scissor.bottom <= scissor.top) && depth && !depthOnlyRaster &&
+                    vr::StereoViewsActive() && scissorLeft < int32_t(color->width) && scissorTop < int32_t(color->height))
+                {
+                    static std::atomic<uint32_t> logged{0};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+                        LOG_NOTICE("renderer: VR draw without its narrower depth attachment f{} vs={:016x} ps={:016x} color {}x{} depth {}x{} scissor ({},{})-({},{})",
+                            frame, key.vs, key.ps, color->width, color->height, depth->width, depth->height,
+                            scissorLeft, scissorTop, scissorRight, scissorBottom);
+                    key.depthControl &= ~0x7u;  // stencil, depth test and depth write off
+                    key.depthFormat = 0;
+                    key.depthBias = 0;
+                    key.slopeBias = 0;
+                    depth = nullptr;
+                    pipeline = GetPipeline(key, vs, ps, color->format, RenderFormat::UNKNOWN, true);
+                    if (!pipeline) { pipelineDeferred = false; drops.pipeline++; return; }
+                    scissor = RenderRect(std::min(scissorLeft, int32_t(color->width)), std::min(scissorTop, int32_t(color->height)),
+                        std::min(scissorRight, int32_t(color->width)), std::min(scissorBottom, int32_t(color->height)));
+                }
                 if (scissor.right <= scissor.left || scissor.bottom <= scissor.top)
                 {
+                    if (key.ps == 0xb4b4d54a7a2d6b96ull) {
+                        static std::atomic<uint32_t> logged{0};
+                        if (logged.fetch_add(1, std::memory_order_relaxed) < 6)
+                            LOG_NOTICE("renderer: tone map dropped by scissor f{} raw tl={:#x} br={:#x} window={:#x} mode={:#x} raster guest {}x{} guest scissor ({},{})-({},{}) physical ({},{})-({},{}) color {}x{} depth {} {}x{} depthOnly={} promoted={}",
+                                frame, Reg(REG_PA_SC_WINDOW_SCISSOR_TL), Reg(REG_PA_SC_WINDOW_SCISSOR_BR), Reg(REG_PA_SC_WINDOW_OFFSET),
+                                Reg(REG_PA_SU_SC_MODE_CNTL), rasterTarget->guestWidth, rasterTarget->guestHeight,
+                                guestScissor.left, guestScissor.top, guestScissor.right, guestScissor.bottom,
+                                scissorLeft, scissorTop, scissorRight, scissorBottom, color->width, color->height,
+                                depth != nullptr, depth ? depth->width : 0, depth ? depth->height : 0, depthOnlyRaster, scenePromotionActivated);
+                    }
                     drops.scissor++;
                     return;
                 }
+                toneCheck(91);
                 // Match the PSO's attachments. A masked color target may be
                 // 2x-scaled while the actual depth raster target is fixed-size.
                 // Keeping that unused attachment makes VkFramebuffer invalid
@@ -11730,6 +12106,7 @@ void main()
                 }
                 recordProbe.Enter(record_timing::Phase::Pipeline);
                 const auto& samplerVersion = samplerState.Current();
+                toneCheck(samplerVersion ? 92 : 93);
                 if (!samplerVersion) return;
                 const auto versionsBefore = Gpu().samplerVersions.size();
                 sampling::Retain(Gpu().samplerVersions, samplerVersion);
@@ -11905,6 +12282,8 @@ void main()
                     }
                     SHADER_LOG_INFO("draw-textures", RendererByteFnv, "renderer: draw textures{}", texs);
                 }
+                toneCheck(10);
+                ToneProbe(1, key.ps, viewport.x);
                 if (drawLogs < 24 || (traceFrame && frame >= traceFrame && frame < traceFrame + traceCount))
                 {
                     drawLogs++;
@@ -11958,15 +12337,81 @@ void main()
                     const auto* source = FindResolved((fetch1 >> 12) << 12, fetch1 & 0x3f);
                     return source && source->tex && source->tex->guestWidth >= 1200;
                 };
-                const bool hudPerEye = color && !depthOnlyRaster && vr::StereoViewsActive() && !samplesFullFrame() &&
+                // HUD position "Fixed in space": the canvas goes into its own layer (see vrHudLayer).
+                bool drawnToHudLayer = false;
+                if (color && !depthOnlyRaster && !occlusionPool && !countingPipeline && vr::StereoViewsActive() && !vr::FlatFrame() && vr::HudLayerActive() && !samplesFullFrame() &&
+                    vr::HudCanvas(rasterViewport, attachmentWidth, attachmentHeight, color->guestWidth, key.vs, key.ps))
+                {
+                    // 8-bit like the frame the headset gets (an FP16 layer copied into the 8-bit
+                    // swapchain came out as garbage).
+                    HostTexture* hud = AcquireVrHudLayer(RenderFormat::R8G8B8A8_UNORM);
+                    auto layerKey = key;
+                    layerKey.colorMask |= 8u;
+                    // Over a transparent layer: colour as the game blends it, alpha accumulated as
+                    // coverage (ONE, INV_SRC_ALPHA), which leaves premultiplied colour.
+                    layerKey.blend = (key.blend & 0xFFFFu) | (1u << 16) | (7u << 24);
+                    if ((key.blend & 0x1Fu) == 1u && ((key.blend >> 8) & 0x1Fu) == 0u) layerKey.blend = (key.blend & 0xFFFFu) | (1u << 16);
+                    layerKey.depthControl &= ~0x7u;
+                    layerKey.depthBias = 0;
+                    layerKey.slopeBias = 0;
+                    if (hud) {
+                        layerKey.rtFormat = uint32_t(hud->format);
+                        layerKey.depthFormat = 0;
+                    }
+                    RenderPipeline* layerPipeline = hud ? GetPipeline(layerKey, vs, ps, hud->format, RenderFormat::UNKNOWN, true) : nullptr;
+                    if (layerPipeline) {
+                        Transition(*hud, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
+                        BindTargets(hud, nullptr);
+                        if (vrHudNeedsClear) { commandList->clearColor(0, RenderColor(0, 0, 0, 0)); vrHudNeedsClear = false; }
+                        const float sx = float(hud->width) / float(attachmentWidth), sy = float(hud->height) / float(attachmentHeight);
+                        RenderViewport layerViewport = rasterViewport;
+                        layerViewport.x *= sx; layerViewport.y *= sy; layerViewport.width *= sx; layerViewport.height *= sy;
+                        const RenderRect layerScissor(std::clamp(int32_t(std::floor(scissor.left * sx)), 0, int32_t(hud->width)),
+                            std::clamp(int32_t(std::floor(scissor.top * sy)), 0, int32_t(hud->height)),
+                            std::clamp(int32_t(std::ceil(scissor.right * sx)), 0, int32_t(hud->width)),
+                            std::clamp(int32_t(std::ceil(scissor.bottom * sy)), 0, int32_t(hud->height)));
+                        if (layerScissor.right > layerScissor.left && layerScissor.bottom > layerScissor.top) {
+                            commandList->setPipeline(layerPipeline);
+                            commandList->setViewports(&layerViewport, 1);
+                            commandList->setScissors(&layerScissor, 1);
+                            if (useIndices)
+                                commandList->drawIndexedInstanced(indexCount, 1, 0, baseVertex, 0);
+                            else
+                                commandList->drawInstanced(indexCount, 1, uint32_t(baseVertex), 0);
+                            vrHudDrawn = true;
+                        }
+                        // The next draw binds its own targets again.
+                        commandList->setPipeline(pipeline);
+                        BindTargets(depthOnlyRaster && !depthOnlyKeepsColor ? nullptr : color, depth);
+                    }
+                    drawnToHudLayer = true;
+                }
+                const bool hudPerEye = color && !depthOnlyRaster && vr::StereoViewsActive() && !vr::FlatFrame() && !samplesFullFrame() &&
                     vr::HudEyeRects(rasterViewport, attachmentWidth, attachmentHeight, color->guestWidth, key.vs, key.ps,
                         hudEyes.data(), hudScissors.data());
-                for (uint32_t pass = 0; pass < (hudPerEye ? 2u : 1u); ++pass)
+                for (uint32_t pass = 0; pass < (drawnToHudLayer ? 0u : hudPerEye ? 2u : 1u); ++pass)
                 {
                     if (hudPerEye)
                     {
-                        RenderRect eyeScissor(std::max(scissor.left, hudScissors[pass].left), std::max(scissor.top, hudScissors[pass].top),
-                            std::min(scissor.right, hudScissors[pass].right), std::min(scissor.bottom, hudScissors[pass].bottom));
+                        // The draw's own scissor (e.g. the minimap's mask) moves with the
+                        // geometry: map it through the same viewport transform, then
+                        // keep it inside this eye's half.
+                        const auto& eye = hudEyes[pass];
+                        const float sx = eye.width / rasterViewport.width, sy = eye.height / rasterViewport.height;
+                        const auto mapX = [&](int32_t v) { return int32_t(std::floor(eye.x + (float(v) - rasterViewport.x) * sx)); };
+                        const auto mapY = [&](int32_t v) { return int32_t(std::floor(eye.y + (float(v) - rasterViewport.y) * sy)); };
+                        static const bool mapScissor = [] { const char* v = getenv("LO_VR_HUD_SCISSOR"); return !v || v[0] != '0'; }();
+                        RenderRect eyeScissor = mapScissor
+                            ? RenderRect(std::max(mapX(scissor.left), hudScissors[pass].left), std::max(mapY(scissor.top), hudScissors[pass].top),
+                                std::min(mapX(scissor.right) + 1, hudScissors[pass].right), std::min(mapY(scissor.bottom) + 1, hudScissors[pass].bottom))
+                            : RenderRect(std::max(scissor.left, hudScissors[pass].left), std::max(scissor.top, hudScissors[pass].top),
+                                std::min(scissor.right, hudScissors[pass].right), std::min(scissor.bottom, hudScissors[pass].bottom));
+                        static std::atomic<uint32_t> hudLogs{0};
+                        if (hudLogs.fetch_add(1) < 12)
+                            LOG_NOTICE("vr: hud draw eye {} viewport ({:.0f},{:.0f} {:.0f}x{:.0f}) scissor ({},{})-({},{}) -> panel ({:.0f},{:.0f} {:.0f}x{:.0f}) scissor ({},{})-({},{})",
+                                pass, rasterViewport.x, rasterViewport.y, rasterViewport.width, rasterViewport.height,
+                                scissor.left, scissor.top, scissor.right, scissor.bottom, eye.x, eye.y, eye.width, eye.height,
+                                eyeScissor.left, eyeScissor.top, eyeScissor.right, eyeScissor.bottom);
                         if (eyeScissor.right <= eyeScissor.left || eyeScissor.bottom <= eyeScissor.top) continue;
                         commandList->setViewports(&hudEyes[pass], 1);
                         commandList->setScissors(&eyeScissor, 1);
@@ -13706,8 +14151,13 @@ void main()
                 QueueResolveTrace(tex, destBase);
                 const auto& captureEnvironment = GetHotCaptureEnvironment();
                 const uint32_t dumpFrame = captureFrame ? captureFrame : captureEnvironment.dumpResolveFrame;
-                if (!dumpFrame || frame != dumpFrame)
+                // LO_DUMP_RESOLVE_ADDR=<hex> (developer): also the first resolves to that address, any frame.
+                static const uint32_t dumpAddress = getenv("LO_DUMP_RESOLVE_ADDR") ? uint32_t(strtoul(getenv("LO_DUMP_RESOLVE_ADDR"), nullptr, 16)) : 0;
+                static uint32_t addressDumps = 0;
+                const bool addressDump = dumpAddress && destBase == dumpAddress && addressDumps < 4;
+                if (!addressDump && (!dumpFrame || frame != dumpFrame))
                     return;
+                if (addressDump) ++addressDumps;
                 uint32_t bpp = tex.format == RenderFormat::R8G8B8A8_UNORM ? 4 : tex.format == RenderFormat::R16G16B16A16_FLOAT ? 8 : tex.format == RenderFormat::R32_FLOAT ? 4 : 0;
                 if (!bpp)
                     return;
@@ -14381,8 +14831,20 @@ void main()
                 uint32_t x1 = std::min<uint32_t>(scissorBr & 0x3FFF, pitch), y1 = std::min<uint32_t>((scissorBr >> 16) & 0x3FFF, rtHeight);
                 if (x1 <= x0 || y1 <= y0)
                     return;
+                // VR stereo: a view's post-processing resolves (and clears) only its own rectangle.
+                // The menu's saved scene is a whole-surface resolve made once, in the first view's
+                // post-processing; the other eye's part of the surface does not hold its scene then,
+                // so that part is filled from the other eye's own latest resolve of the same surface
+                // (the same scene a frame earlier: real stereo), or with this eye's picture.
+                uint32_t vrDuplicateWidth = 0;
+                if (vrClip.right > vrClip.left) {
+                    if (vrClip.left == 0 && vrClip.top == 0 && x0 == 0 && x1 > uint32_t(vrClip.right) && !(copyControl & 0x300))
+                        vrDuplicateWidth = uint32_t(vrClip.right);
+                    x0 = std::max<uint32_t>(x0, uint32_t(std::max(vrClip.left, 0))); y0 = std::max<uint32_t>(y0, uint32_t(std::max(vrClip.top, 0)));
+                    x1 = std::min<uint32_t>(x1, uint32_t(std::max(vrClip.right, 0))); y1 = std::min<uint32_t>(y1, uint32_t(std::max(vrClip.bottom, 0)));
+                    if (x1 <= x0 || y1 <= y0) return;
+                }
                 uint32_t copyWidth = std::min(x1 - x0, destPitch), copyHeight = std::min(y1 - y0, destHeight);
-
                 bool depthCopy = srcSelect == 4;
                 if (depthCopy)
                 {
@@ -14427,6 +14889,48 @@ void main()
                 {
                     if (!ResolveOnGpu(*color, destBase, destFormat, destPitch, destHeight, x0, y0, copyWidth, copyHeight))
                         return;
+                    static const bool duplicateEnabled = [] { const char* v = getenv("LO_VR_MENU_BACKDROP_COPY"); return !v || v[0] != '0'; }();
+                    const uint32_t surfaceKey = (colorInfo & 0xFFFu) | (((colorInfo >> 16) & 0xFu) << 16);
+                    if (vrClip.left > 0 && !(copyControl & 0x300) && destBase != 0) {
+                        LaterViewResolve& later = vrLaterViewResolves[surfaceKey];
+                        if (later.frame != frame) later = {destBase, destFormat, frame};
+                    }
+                    if (duplicateEnabled && vrDuplicateWidth) {
+                        // The other eye's own picture of this surface, if it has one of the same shape.
+                        HostTexture* otherEye = nullptr;
+                        if (auto it = vrLaterViewResolves.find(surfaceKey); it != vrLaterViewResolves.end() &&
+                            (it->second.destBase != destBase || it->second.destFormat != destFormat)) {
+                            ResolvedSurface& other = ResolvedSlot(it->second.destBase, it->second.destFormat);
+                            if (other.tex && other.tex->texture) otherEye = other.tex.get();
+                        }
+                        ResolvedSurface& rs = ResolvedSlot(destBase, destFormat);
+                        if (otherEye && (otherEye->format != rs.tex->format || otherEye->width != rs.tex->width ||
+                                         otherEye->height != rs.tex->height)) otherEye = nullptr;
+                        if (rs.tex && rs.tex->texture && rs.tex->format == color->format) {
+                            const uint32_t w = color->ScaleX(vrDuplicateWidth), h = color->ScaleY(copyHeight);
+                            const uint32_t sy = color->ScaleY(y0);
+                            // The other eye's resolve is taken before the post chain's gamma step (its picture is
+                            // the capture's to the power 2.2), so it is gamma-encoded on the way.
+                            static const float otherGamma = [] { const char* v = getenv("LO_VR_MENU_BACKDROP_GAMMA"); return v ? float(atof(v)) : 2.2f; }();
+                            for (uint32_t dx = w; dx + w <= rs.tex->width && dx + w <= color->width * 2; dx += w) {
+                                if (otherEye && otherGamma > 0.0f && otherGamma != 1.0f &&
+                                    GammaCopyRegion(*otherEye, *rs.tex, dx, sy, w, h, 1.0f / otherGamma)) continue;
+                                HostTexture& source = otherEye ? *otherEye : *color;
+                                Transition(source, RenderTextureLayout::COPY_SOURCE, RenderBarrierStage::COPY);
+                                Transition(*rs.tex, RenderTextureLayout::COPY_DEST, RenderBarrierStage::COPY);
+                                RenderBox box{otherEye ? int32_t(dx) : 0, int32_t(sy), otherEye ? int32_t(dx + w) : int32_t(w), int32_t(sy + h), 0, 1};
+                                commandList->copyTextureRegion(RenderTextureCopyLocation::Subresource(rs.tex->texture.get()),
+                                    RenderTextureCopyLocation::Subresource(source.texture.get()), dx, sy, 0, &box);
+                            }
+                            LOG_NOTICE("renderer: VR menu backdrop {:#x}: other eye from {}", destBase,
+                                otherEye ? fmt::format("its own resolve {:#x}", vrLaterViewResolves[surfaceKey].destBase) : std::string("this eye's picture"));
+                            Transition(*rs.tex, RenderTextureLayout::SHADER_READ, RenderBarrierStage::GRAPHICS);
+                            if (otherEye) Transition(*otherEye, RenderTextureLayout::SHADER_READ, RenderBarrierStage::GRAPHICS);
+                            consecutiveResolveCopies.Invalidate();
+                            static const bool dumpAfter = getenv("LO_DUMP_RESOLVE_ADDR") != nullptr;
+                            if (dumpAfter) DumpResolveStep(*rs.tex, destBase, rs.writeOrdinal, rs.destFormat);
+                        }
+                    }
                     InvalidateRange(destBase, ((destPitch + 31) & ~31u) * copyHeight * (destFormat == 32 ? 8 : 4));
                 }
                 else
@@ -14545,6 +15049,7 @@ void main()
                     QueueClear(*color, pending_clear::ColorOp(c, {{int32_t(color->ScaleX(x0)), int32_t(color->ScaleY(y0)),
                         int32_t(color->ScaleX(x1)), int32_t(color->ScaleY(y1))}}));
                     color->hdrValid = false;
+                    color->MarkOwnerDirty(int32_t(x0), int32_t(y0), int32_t(x1), int32_t(y1));
 #if defined(LO_GPU_PLUME)
                     HandleFsrAlphaRgbWriter(*color, "resolve_color_clear");
 #endif
@@ -15199,7 +15704,63 @@ void main()
         if (!rs || !rs->tex)
             return;
         if (!g_renderer->Begin()) return;
+        // VR (mono/stereo): LumaSharpen on the frame the headset gets (VR tab → Sharpening).
+        if (vr::RequestedMode() == vr::Mode::Mono || vr::RequestedMode() == vr::Mode::Stereo) {
+            const uint32_t sharpen = settings::GetConfig().vrSharpen;
+            // Once per resolve: a frame presented again is already sharpened.
+            static uint64_t sharpenedOrdinal = 0;
+            static const void* sharpenedTexture = nullptr;
+            if (sharpen && vr::Active() && (rs->writeOrdinal != sharpenedOrdinal || rs->tex.get() != sharpenedTexture) &&
+                g_renderer->SharpenInPlace(*rs->tex, float(sharpen) / 100.0f)) {
+                sharpenedOrdinal = rs->writeOrdinal;
+                sharpenedTexture = rs->tex.get();
+                g_renderer->consecutiveResolveCopies.Invalidate();
+            }
+            // The game's display gamma ramp and the player's Brightness / Gamma, which the desktop
+            // applies at presentation (presentation.cpp finishFrame); the headset takes the frame
+            // before that. Presentation skips both while this runs (vr::DisplayCurveInFrame).
+            static uint64_t curvedOrdinal = 0;
+            static const void* curvedTexture = nullptr;
+            static float curve[256][4];
+            static uint32_t curveGeneration = UINT32_MAX;
+            static int curveBrightness = INT_MIN;
+            static uint32_t curveGamma = 0;
+            static bool curveIdentity = true;
+            const auto& cfg = settings::GetConfig();
+            const uint32_t generation = display_gamma::Generation();
+            const uint32_t gamma = std::max(cfg.displayGamma, 1u);
+            if (generation != curveGeneration || cfg.displayBrightness != curveBrightness || gamma != curveGamma) {
+                const auto ramp = display_gamma::Snapshot();
+                const float black = float(-cfg.displayBrightness) / 200.0f, exponent = 100.0f / float(gamma);
+                for (uint32_t i = 0; i < 256; ++i)
+                    for (uint32_t c = 0; c < 3; ++c)
+                        curve[i][c] = std::pow(std::clamp((ramp.values[3 * i + c] - black) / (1.0f - black), 0.0f, 1.0f), exponent);
+                for (uint32_t i = 0; i < 256; ++i) curve[i][3] = 1.0f;
+                curveIdentity = ramp.identity && cfg.displayBrightness == 0 && gamma == 100;
+                curveGeneration = generation;
+                curveBrightness = cfg.displayBrightness;
+                curveGamma = gamma;
+            }
+            const bool apply = vr::Active() && !curveIdentity && g_renderer->vulkan;
+            vr::SetDisplayCurveInFrame(apply);
+            if (apply && (rs->writeOrdinal != curvedOrdinal || rs->tex.get() != curvedTexture) &&
+                g_renderer->CurveInPlace(*rs->tex, curve)) {
+                curvedOrdinal = rs->writeOrdinal;
+                curvedTexture = rs->tex.get();
+                g_renderer->consecutiveResolveCopies.Invalidate();
+            }
+        }
         g_renderer->Transition(*rs->tex, RenderTextureLayout::COPY_SOURCE, RenderBarrierStage::COPY);
+        if (vr::HudLayerActive()) {
+            // This frame's HUD layer (nothing when the game drew no 2D canvas this frame).
+            auto& r = *g_renderer;
+            if (r.vrHudDrawn && r.vrHudLayer && r.vrHudLayer->texture) {
+                r.Transition(*r.vrHudLayer, RenderTextureLayout::COPY_SOURCE, RenderBarrierStage::COPY);
+                vr::SetHudLayerSource(r.vrHudLayer->texture.get(), r.vrHudLayer->width, r.vrHudLayer->height);
+            } else vr::SetHudLayerSource(nullptr, 0, 0);
+            r.vrHudDrawn = false;
+            r.vrHudNeedsClear = true;
+        }
         if (hdrSceneEnabled.load(std::memory_order_relaxed) && rs->hdrTex &&
             rs->hdrWriteOrdinal && rs->hdrWriteOrdinal == rs->writeOrdinal)
             g_renderer->Transition(*rs->hdrTex, RenderTextureLayout::COPY_SOURCE, RenderBarrierStage::COPY);
@@ -15914,6 +16475,13 @@ void main()
         if (found != catalogRoles.end() && found->second == role) return;
         catalogRoles[key] = role;
         catalogGeneration.fetch_add(1, std::memory_order_release);
+    }
+
+    void SetVrClip(int32_t left, int32_t top, int32_t right, int32_t bottom)
+    {
+#ifdef LO_GPU_PLUME
+        if (g_renderer) g_renderer->vrClip = {left, top, right, bottom};
+#endif
     }
 
     void ClearMovieBars(uint32_t surfaceInfo, uint32_t colorInfo,

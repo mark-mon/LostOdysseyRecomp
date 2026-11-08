@@ -1,6 +1,7 @@
 #include <stdafx.h>
 #include <os/logger.h>
 #include "encounter_defer.h"
+#include <xr/vr.h>
 #include <chrono>
 
 // Issue #114. The walking encounter (sub_829E3048) queues a battle in the
@@ -83,7 +84,10 @@ PPC_FUNC(sub_828278A0)
     }
     __imp__sub_828278A0(ctx, base);
     if (ctx.r3.s32 == 0)
+    {
         heldRequest = {caller == WalkingEncounterReturn, id, 0};
+        vr::NoteBattleRequested();
+    }
 }
 
 // The other writer of slot 1 (stores phase 1 without the busy check). If it

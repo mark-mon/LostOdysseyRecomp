@@ -143,6 +143,18 @@ struct Config
     // View-frustum culling, 0..200 in steps of 10: 100 retail, lower draws
     // objects at the screen edges longer, higher hides them sooner. Applied live.
     uint32_t cullingPercent = 100;
+    // VR through OpenXR (xr/vr.h): 0 Off, 1 Theater, 2 Mono, 3 Stereo. Applied
+    // after a restart; the LO_VR environment variable overrides it.
+    uint32_t vrMode = 0;
+    uint32_t vrHudDegrees = 36;      // HUD panel width in degrees (16..80). Applied live.
+    uint32_t vrHudDistanceCm = 150;  // HUD panel distance (50..500 cm). Applied live.
+    uint32_t vrWorldScale = 100;     // Unreal units per metre of head movement (10..200; 100 = life size). Applied live.
+    bool vrLevelHorizon = true;      // Headset owns pitch/roll; false follows the game camera's pitch. Live.
+    uint32_t vrHudAnchor = 0;        // 0 HUD panel follows the head, 1 fixed in space (in front of the recentred view). Live.
+    uint32_t vrSharpen = 0;          // LumaSharpen strength on the headset image, hundredths (0..500; 0 off). Live.
+    // Per-eye render size as a percentage (per axis) of the headset's recommended size (30..300).
+    // Mono/stereo replace Render resolution with it. Applied live.
+    uint32_t vrResolutionPercent = 100;
     gpu::upscaling::Upscaler upscaler = gpu::upscaling::Upscaler::Off;
     gpu::upscaling::DlssQuality dlssQuality = gpu::upscaling::DlssQuality::Quality;
     uint32_t dlssModel = 0; // DLSS SR model (render preset): 0 M, 1 L. Applied after saving.

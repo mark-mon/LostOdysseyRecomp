@@ -2,8 +2,11 @@
 
 #include "xr/vr.h"
 
+#include <atomic>
+
 #include <os/logger.h>
 #include <kernel/memory.h>
+#include <settings/config.h>
 
 #if defined(LO_GPU_PLUME) && (defined(_WIN32) || defined(__linux__)) && !defined(__ANDROID__)
 #define LO_VR_VULKAN 1
@@ -23,11 +26,19 @@
 
 namespace vr
 {
+namespace { std::atomic<bool> g_displayCurveInFrame{false}; }
+void SetDisplayCurveInFrame(bool inFrame) { g_displayCurveInFrame.store(inFrame, std::memory_order_relaxed); }
+bool DisplayCurveInFrame() { return g_displayCurveInFrame.load(std::memory_order_relaxed); }
 Mode RequestedMode()
 {
     static const Mode mode = [] {
         const char* value = getenv("LO_VR");
-        if (!value || !*value || value[0] == '0') return Mode::Off;
+        if (!value || !*value) {
+            // Graphics → VR mode (read once: the session is created with the device).
+            const uint32_t configured = settings::GetConfig().vrMode;
+            return configured <= 3 ? Mode(configured) : Mode::Off;
+        }
+        if (value[0] == '0') return Mode::Off;
         const std::string_view text(value);
         if (text == "theater" || text == "1") return Mode::Theater;
         if (text == "mono" || text == "2") return Mode::Mono;
@@ -46,8 +57,17 @@ void OnDeviceCreated(plume::RenderDevice*, plume::RenderCommandQueue*) {}
 void SubmitDesktopFrame(plume::RenderTexture*, uint32_t, uint32_t, std::vector<plume::RenderCommandSemaphore*>&) {}
 bool AdjustMainView(uint32_t) { return false; }
 void RequestRecenter() {}
+void SetHostMenuVisible(bool) {}
 void SetFrameSource(plume::RenderTexture*, uint32_t, uint32_t) {}
 bool StereoViewsActive() { return false; }
+bool FlatFrame() { return false; }
+bool HudLayerActive() { return false; }
+bool HudCanvas(const plume::RenderViewport&, int32_t, int32_t, uint32_t, uint64_t, uint64_t) { return false; }
+void SetHudLayerSource(plume::RenderTexture*, uint32_t, uint32_t) {}
+uint32_t PoseSerialForView(uint32_t) { return 0; }
+void SetFramePoseSerial(uint32_t) {}
+bool RenderSize(uint32_t, uint32_t&, uint32_t&) { return false; }
+bool RecommendedEyeSize(uint32_t&, uint32_t&) { return false; }
 bool HudEyeRects(const plume::RenderViewport&, int32_t, int32_t, uint32_t, uint64_t, uint64_t, plume::RenderViewport*, plume::RenderRect*) { return false; }
 void SetCurrentEye(int) {}
 bool Active() { return false; }
@@ -130,6 +150,7 @@ struct State
     XrInstance instance = XR_NULL_HANDLE;
     XrSystemId system = XR_NULL_SYSTEM_ID;
     std::string systemName;
+    uint32_t recommendedWidth = 0, recommendedHeight = 0;  // per eye, from the runtime
     plume::VulkanExtensionHooks inner;
 
     plume::VulkanDevice* device = nullptr;
@@ -140,6 +161,8 @@ struct State
     XrSpace local = XR_NULL_HANDLE;
     XrSpace view = XR_NULL_HANDLE;  // the head, for recentering
     Swapchain quad;
+    Swapchain hud;  // HUD layer (HUD position: Fixed in space)
+    Swapchain desk; // mono/stereo: the desktop image while a host menu is open (its own size)
     VkCommandPool pool = VK_NULL_HANDLE;
     std::array<FrameSlot, 3> slots;
     uint32_t slot = 0;
@@ -176,6 +199,33 @@ HeadPose g_rendered;   // what the game thread last rendered the main view with
 uint64_t g_adjustedViews = 0;
 thread_local int t_eye = -1;
 
+// The pose each frame's views were built with, keyed by a hash of the view matrix the game
+// renders with (the FViewInfo the renderer works from copies the FSceneView's), under g_poseMutex.
+struct PoseRecord { uint64_t key = 0; uint32_t serial = 0; HeadPose pose; };
+std::array<PoseRecord, 64> g_poseRecords{};
+uint32_t g_poseRecordNext = 0, g_poseSerial = 0;
+std::atomic<uint32_t> g_framePoseSerial{0};  // GPU thread: the frame being processed
+uint64_t ViewKey(uint32_t view)
+{
+    uint64_t hash = 0xcbf29ce484222325ull;
+    for (uint32_t i = 0; i < 0x40; ++i) { hash ^= g_memory.base[view + 0x40 + i]; hash *= 0x100000001b3ull; }
+    return hash ? hash : 1;
+}
+
+XrQuaternionf QuatMul(const XrQuaternionf& a, const XrQuaternionf& b)
+{
+    return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+            a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+            a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+
+XrVector3f QuatRotate(const XrQuaternionf& q, const XrVector3f& v)
+{
+    const float tx = 2 * (q.y * v.z - q.z * v.y), ty = 2 * (q.z * v.x - q.x * v.z), tz = 2 * (q.x * v.y - q.y * v.x);
+    return {v.x + q.w * tx + (q.y * tz - q.z * ty), v.y + q.w * ty + (q.z * tx - q.x * tz), v.z + q.w * tz + (q.x * ty - q.y * tx)};
+}
+
 // Mono renders one 16:9 image (the guest's 1280x720 shape) for both eyes. Its
 // frustum is the union of both eyes, widened to 16:9 so it covers them fully.
 Tangents MonoTangents(const HeadPose& head)
@@ -202,16 +252,38 @@ XrFovf ToFov(const Tangents& t)
     return {std::atan(t.left), std::atan(t.right), std::atan(t.up), std::atan(t.down)};
 }
 
-float WorldScale()
+// Live VR settings (Graphics menu), copied once per frame on the present thread
+// so per-draw code never copies the whole Config. LO_VR_* variables override them.
+struct Tunables
 {
-    // Unreal units per metre for head translation. LO_VR_SCALE overrides (tuning).
-    static const float scale = [] {
-        const char* v = getenv("LO_VR_SCALE");
-        const float f = v ? float(atof(v)) : 0.0f;
-        return f > 0.0f ? f : 50.0f;
-    }();
-    return scale;
+    std::atomic<float> worldScale{100.0f}, hudDegrees{36.0f}, hudDistance{1.5f};
+    std::atomic<bool> levelHorizon{true};
+    std::atomic<bool> worldHud{false};
+};
+Tunables g_tunables;
+
+float EnvFloat(const char* name, float low, float high)
+{
+    const char* v = getenv(name);
+    const float f = v ? float(atof(v)) : 0.0f;
+    return f >= low && f <= high ? f : 0.0f;
 }
+
+void RefreshTunables()
+{
+    static const float envScale = EnvFloat("LO_VR_SCALE", 0.01f, 10000.0f);
+    static const float envDegrees = EnvFloat("LO_VR_HUD_DEG", 10.0f, 120.0f);
+    static const float envDistance = EnvFloat("LO_VR_HUD_DIST", 0.3f, 20.0f);
+    static const char* envPitch = getenv("LO_VR_KEEP_PITCH");
+    const auto config = settings::GetConfig();
+    g_tunables.worldScale = envScale > 0 ? envScale : float(config.vrWorldScale);
+    g_tunables.hudDegrees = envDegrees > 0 ? envDegrees : float(config.vrHudDegrees);
+    g_tunables.hudDistance = envDistance > 0 ? envDistance : float(config.vrHudDistanceCm) / 100.0f;
+    g_tunables.levelHorizon = envPitch ? envPitch[0] != '1' : config.vrLevelHorizon;
+    g_tunables.worldHud = config.vrHudAnchor == 1;
+}
+
+float WorldScale() { return g_tunables.worldScale.load(std::memory_order_relaxed); }
 
 // Guest memory, big-endian floats.
 float LoadGuestFloat(uint32_t address)
@@ -361,13 +433,49 @@ void DestroySwapchain(Swapchain& chain)
     if (chain.handle) x.xrDestroySwapchain(chain.handle);
     chain = {};
 }
-
-bool EnsureQuadSwapchain(uint32_t width, uint32_t height, VkFormat source)
+int64_t PickFormat(VkFormat source);
+// The HUD layer's swapchain: exactly the layer's size and format.
+bool EnsureHudSwapchain(uint32_t width, uint32_t height, VkFormat source)
 {
-    if (s.quad.handle && s.quad.width == width && s.quad.height == height) return true;
-    if (s.quad.handle) {
+    // vkCmdCopyImage needs the same texel size: 8-bit RGBA layers only.
+    if (source != VK_FORMAT_R8G8B8A8_UNORM && source != VK_FORMAT_R8G8B8A8_SRGB &&
+        source != VK_FORMAT_B8G8R8A8_UNORM && source != VK_FORMAT_B8G8R8A8_SRGB) return false;
+    const int64_t format = PickFormat(source);
+    if (!format) return false;
+    if (s.hud.handle && s.hud.width == width && s.hud.height == height && s.hud.format == format) return true;
+    if (s.hud.handle) { vkQueueWaitIdle(s.queue->queue->vk); DestroySwapchain(s.hud); }
+    XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    info.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    info.format = format;
+    info.sampleCount = 1;
+    info.width = width;
+    info.height = height;
+    info.faceCount = 1;
+    info.arraySize = 1;
+    info.mipCount = 1;
+    if (!Check(x.xrCreateSwapchain(s.session, &info, &s.hud.handle), "xrCreateSwapchain (HUD)")) return false;
+    uint32_t count = 0;
+    x.xrEnumerateSwapchainImages(s.hud.handle, 0, &count, nullptr);
+    s.hud.images.assign(count, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+    x.xrEnumerateSwapchainImages(s.hud.handle, count, &count, reinterpret_cast<XrSwapchainImageBaseHeader*>(s.hud.images.data()));
+    s.hud.format = format;
+    s.hud.width = width;
+    s.hud.height = height;
+    LOG_NOTICE("vr: HUD layer swapchain {}x{} format {}", width, height, format);
+    return true;
+}
+
+bool EnsureQuadSwapchain(Swapchain& chain, uint32_t width, uint32_t height, VkFormat source)
+{
+    // Never shrink: a smaller image (the desktop image while a host menu is open)
+    // is copied into the top-left of the larger swapchain. Recreating the swapchain
+    // whenever the source alternates left the headset showing a stale image.
+    if (chain.handle && width <= chain.width && height <= chain.height) return true;
+    if (chain.handle) {
+        width = std::max(width, chain.width);
+        height = std::max(height, chain.height);
         vkQueueWaitIdle(s.queue->queue->vk);
-        DestroySwapchain(s.quad);
+        DestroySwapchain(chain);
     }
     const int64_t format = PickFormat(source);
     if (!format) { LOG_WARNING("vr: the runtime offers no swapchain format matching {}", int(source)); return false; }
@@ -380,16 +488,16 @@ bool EnsureQuadSwapchain(uint32_t width, uint32_t height, VkFormat source)
     info.faceCount = 1;
     info.arraySize = 1;
     info.mipCount = 1;
-    if (!Check(x.xrCreateSwapchain(s.session, &info, &s.quad.handle), "xrCreateSwapchain")) return false;
+    if (!Check(x.xrCreateSwapchain(s.session, &info, &chain.handle), "xrCreateSwapchain")) return false;
     uint32_t count = 0;
-    x.xrEnumerateSwapchainImages(s.quad.handle, 0, &count, nullptr);
-    s.quad.images.assign(count, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
-    x.xrEnumerateSwapchainImages(s.quad.handle, count, &count,
-        reinterpret_cast<XrSwapchainImageBaseHeader*>(s.quad.images.data()));
-    s.quad.format = format;
-    s.quad.width = width;
-    s.quad.height = height;
-    LOG_NOTICE("vr: theater swapchain {}x{} format {} ({} images)", width, height, format, count);
+    x.xrEnumerateSwapchainImages(chain.handle, 0, &count, nullptr);
+    chain.images.assign(count, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+    x.xrEnumerateSwapchainImages(chain.handle, count, &count,
+        reinterpret_cast<XrSwapchainImageBaseHeader*>(chain.images.data()));
+    chain.format = format;
+    chain.width = width;
+    chain.height = height;
+    LOG_NOTICE("vr: {} swapchain {}x{} format {} ({} images)", &chain == &s.desk ? "menu" : "theater", width, height, format, count);
     return true;
 }
 
@@ -470,6 +578,17 @@ bool Initialize()
     XrGraphicsRequirementsVulkanKHR requirements{XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
     if (!Check(x.xrGetVulkanGraphicsRequirementsKHR(s.instance, s.system, &requirements), "xrGetVulkanGraphicsRequirementsKHR"))
         return false;
+    {
+        uint32_t count = 0;
+        XrViewConfigurationView views[2] = {{XR_TYPE_VIEW_CONFIGURATION_VIEW}, {XR_TYPE_VIEW_CONFIGURATION_VIEW}};
+        if (XR_SUCCEEDED(x.xrEnumerateViewConfigurationViews(s.instance, s.system, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                2, &count, views)) && count == 2) {
+            s.recommendedWidth = std::max(views[0].recommendedImageRectWidth, views[1].recommendedImageRectWidth);
+            s.recommendedHeight = std::max(views[0].recommendedImageRectHeight, views[1].recommendedImageRectHeight);
+            LOG_NOTICE("vr: recommended per-eye size {}x{} (max {}x{})", s.recommendedWidth, s.recommendedHeight,
+                views[0].maxImageRectWidth, views[0].maxImageRectHeight);
+        }
+    }
     LOG_NOTICE("vr: OpenXR runtime '{}' {}.{}.{}, system '{}', mode {}", properties.runtimeName,
         XR_VERSION_MAJOR(properties.runtimeVersion), XR_VERSION_MINOR(properties.runtimeVersion),
         XR_VERSION_PATCH(properties.runtimeVersion), s.systemName, RequestedMode() == Mode::Stereo ? "stereo" : RequestedMode() == Mode::Mono ? "mono" : "theater");
@@ -592,9 +711,11 @@ struct FrameSource
     plume::RenderTexture* texture = nullptr;
     uint32_t width = 0, height = 0;
     uint64_t frames = 0;  // s.frames when it was handed over (valid for that present only)
+    uint32_t poseSerial = 0;  // the head pose the frame was rendered with (0 unknown)
 };
 std::mutex g_sourceMutex;
 FrameSource g_source;
+FrameSource g_hudSource;  // under g_sourceMutex
 
 VkImageLayout ToVkLayout(plume::RenderTextureLayout layout)
 {
@@ -611,6 +732,17 @@ VkImageLayout ToVkLayout(plume::RenderTextureLayout layout)
     }
 }
 
+void SetHudLayerSource(plume::RenderTexture* texture, uint32_t width, uint32_t height)
+{
+    const std::scoped_lock lock(g_sourceMutex);
+    g_hudSource = {texture, width, height, s.frames, 0};
+}
+
+bool HudLayerActive()
+{
+    return RequestedMode() == Mode::Stereo && s.running && g_tunables.worldHud.load(std::memory_order_relaxed);
+}
+
 void SetFrameSource(plume::RenderTexture* texture, uint32_t width, uint32_t height)
 {
     if (!s.running || RequestedMode() == Mode::Theater) return;
@@ -621,7 +753,7 @@ void SetFrameSource(plume::RenderTexture* texture, uint32_t width, uint32_t heig
             vk->desc.width, vk->desc.height, int(vk->imageFormat));
     }
     const std::scoped_lock lock(g_sourceMutex);
-    g_source = {texture, width, height, s.frames};
+    g_source = {texture, width, height, s.frames, g_framePoseSerial.load(std::memory_order_relaxed)};
 }
 
 bool AdjustMainView(uint32_t view)
@@ -645,8 +777,7 @@ bool AdjustMainView(uint32_t view)
             viewMatrix[12], viewMatrix[13], viewMatrix[14], viewMatrix[15], projection[0], projection[5],
             projection[8], projection[9], projection[10], projection[11], projection[12], projection[13], projection[14], projection[15]);
     }
-    static const bool keepPitch = [] { const char* v = getenv("LO_VR_KEEP_PITCH"); return v && v[0] == '1'; }();
-    if (!keepPitch) viewMatrix = LevelView(viewMatrix);
+    if (g_tunables.levelHorizon.load(std::memory_order_relaxed)) viewMatrix = LevelView(viewMatrix);
     const XrPosef& pose = eye >= 0 ? head.eyePose[eye] : head.pose;
     const Mat4 adjusted = Multiply(viewMatrix, HeadCorrection(pose, WorldScale()));
     for (uint32_t i = 0; i < 16; ++i) StoreGuestFloat(view + 0x40 + i * 4, adjusted[i]);
@@ -660,12 +791,28 @@ bool AdjustMainView(uint32_t view)
     StoreGuestFloat(view + 0x80 + 9 * 4, -(t.up + t.down) / (t.up - t.down));
     {
         // The left eye's view is built first; the frame is complete once the last view of it is.
+        const uint64_t key = ViewKey(view);
         const std::scoped_lock lock(g_poseMutex);
         g_rendered = head;
+        if (eye <= 0) ++g_poseSerial;
+        g_poseRecords[g_poseRecordNext++ % g_poseRecords.size()] = {key, g_poseSerial, head};
     }
     ++g_adjustedViews;
     return true;
 }
+
+uint32_t PoseSerialForView(uint32_t view)
+{
+    if (!s.running || !g_memory.base || !view) return 0;
+    const uint64_t key = ViewKey(view);
+    const std::scoped_lock lock(g_poseMutex);
+    for (const PoseRecord& record : g_poseRecords)
+        if (record.key == key) return record.serial;
+    return 0;
+}
+
+void SetFramePoseSerial(uint32_t serial) { g_framePoseSerial.store(serial, std::memory_order_relaxed); }
+bool FlatFrame() { return (g_framePoseSerial.load(std::memory_order_relaxed) & FlatFrameBit) != 0; }
 
 bool StereoViewsActive()
 {
@@ -676,10 +823,43 @@ bool StereoViewsActive()
 
 void SetCurrentEye(int eye) { t_eye = eye; }
 
+// Planned scene size (game thread), so the present thread knows the game frame that matches it.
+std::atomic<uint32_t> g_plannedWidth{0}, g_plannedHeight{0};
+
+bool RecommendedEyeSize(uint32_t& width, uint32_t& height)
+{
+    if (!s.initialized || !s.recommendedWidth || !s.recommendedHeight) return false;
+    width = s.recommendedWidth;
+    height = s.recommendedHeight;
+    return true;
+}
+
+bool RenderSize(uint32_t percent, uint32_t& width, uint32_t& height)
+{
+    const Mode mode = RequestedMode();
+    if (mode != Mode::Mono && mode != Mode::Stereo) return false;
+    uint32_t eyeWidth = 0, eyeHeight = 0;
+    if (!RecommendedEyeSize(eyeWidth, eyeHeight)) return false;
+    // LO_VR_RESOLUTION=<percent> (developer) overrides the VR tab.
+    static const uint32_t envPercent = [] { const char* v = getenv("LO_VR_RESOLUTION"); return v ? uint32_t(atoi(v)) : 0u; }();
+    const uint32_t scale = std::clamp(envPercent ? envPercent : percent, 30u, 300u);
+    const uint32_t eyes = mode == Mode::Stereo ? 2 : 1;
+    eyeWidth = std::clamp<uint32_t>((eyeWidth * scale + 50) / 100, 256, 16384 / eyes) & ~1u;
+    eyeHeight = std::clamp<uint32_t>((eyeHeight * scale + 50) / 100, 256, 8192) & ~1u;
+    width = eyeWidth * eyes;
+    height = eyeHeight;
+    g_plannedWidth.store(width, std::memory_order_relaxed);
+    g_plannedHeight.store(height, std::memory_order_relaxed);
+    return true;
+}
+
 void RequestRecenter() { g_recenterRequested = true; }
 
-bool HudEyeRects(const plume::RenderViewport& viewport, int32_t targetWidth, int32_t targetHeight, uint32_t guestWidth,
-                 uint64_t vertexShader, uint64_t pixelShader, plume::RenderViewport* eyes, plume::RenderRect* scissors)
+std::atomic<bool> g_hostMenu{false};
+void SetHostMenuVisible(bool visible) { g_hostMenu.store(visible, std::memory_order_relaxed); }
+
+bool HudCanvas(const plume::RenderViewport& viewport, int32_t targetWidth, int32_t targetHeight, uint32_t guestWidth,
+               uint64_t vertexShader, uint64_t pixelShader)
 {
     // The game's full-screen post-processing quads (scene copy, tone map, blur)
     // share one vertex shader; they work on both eye views at once and stay whole.
@@ -734,23 +914,70 @@ bool HudEyeRects(const plume::RenderViewport& viewport, int32_t targetWidth, int
     if (!allowedPs.empty() && std::find(allowedPs.begin(), allowedPs.end(), pixelShader) == allowedPs.end())
     { note("rejected: not in LO_VR_HUD_PS"); return false; }
     const float aspect = viewport.width / viewport.height;
-    if (std::abs(aspect - 16.0f / 9.0f) > 0.05f) { note("rejected: aspect"); return false; }
+    // The canvas covers the whole output: 16:9, or the headset-sized scene target (both eyes side by side).
+    const uint32_t plannedWidth = g_plannedWidth.load(std::memory_order_relaxed), plannedHeight = g_plannedHeight.load(std::memory_order_relaxed);
+    const float plannedAspect = plannedHeight ? float(plannedWidth) / float(plannedHeight) : 16.0f / 9.0f;
+    if (std::abs(aspect - 16.0f / 9.0f) > 0.05f && std::abs(aspect - plannedAspect) > 0.02f) { note("rejected: aspect"); return false; }
     note("taken");
-    // LO_VR_HUD_SCALE: panel width as a fraction of one eye's width (default 0.75).
-    static const float scale = [] {
-        const char* v = getenv("LO_VR_HUD_SCALE");
-        const float f = v ? float(atof(v)) : 0.0f;
-        return f > 0.05f && f <= 1.0f ? f : 0.75f;
-    }();
+    return true;
+}
+
+bool HudEyeRects(const plume::RenderViewport& viewport, int32_t targetWidth, int32_t targetHeight, uint32_t guestWidth,
+                 uint64_t vertexShader, uint64_t pixelShader, plume::RenderViewport* eyes, plume::RenderRect* scissors)
+{
+    if (!HudCanvas(viewport, targetWidth, targetHeight, guestWidth, vertexShader, pixelShader)) return false;
+    auto note = [](const char*) {};
+    // The HUD is a head-locked 16:9 panel LO_VR_HUD_DEG wide (default 36) at LO_VR_HUD_DIST metres
+    // (default 1.5) straight ahead of the head. Each eye draws it where that panel projects through
+    // the eye's own pose and frustum, so both copies converge (canted displays included).
+    const float degrees = g_tunables.hudDegrees.load(std::memory_order_relaxed);
+    const float distance = g_tunables.hudDistance.load(std::memory_order_relaxed);
+    HeadPose head;
+    {
+        // The pose this frame's views were built with (its serial came through the ring before
+        // its HUD draws), so the panel lines up with the scene under it.
+        const std::scoped_lock lock(g_poseMutex);
+        head = g_rendered.valid ? g_rendered : g_latest;
+        if (const uint32_t serial = g_framePoseSerial.load(std::memory_order_relaxed))
+            for (const PoseRecord& record : g_poseRecords)
+                if (record.serial == serial && record.pose.valid) { head = record.pose; break; }
+    }
+    if (!head.valid) { note("rejected: no pose"); return false; }
+    // Fixed in space: the panel hangs straight ahead of where Recenter put the view (the local
+    // space origin, facing -Z) instead of following the head. Out of view, it is not drawn.
+    const bool worldHud = g_tunables.worldHud.load(std::memory_order_relaxed);
+    const XrPosef anchor = worldHud ? XrPosef{{0, 0, 0, 1}, {0, 0, 0}} : head.pose;
+    const float halfWidthM = distance * std::tan(degrees * 0.5f * 3.14159265f / 180.0f);
+    const float halfHeightM = halfWidthM * 9.0f / 16.0f;
     const float half = viewport.width * 0.5f, fullHeight = viewport.height;
-    float w = half * scale, h = w / aspect;
-    if (h > fullHeight) { h = fullHeight; w = h * aspect; }
     for (int e = 0; e < 2; ++e) {
+        const XrPosef& eyePose = head.eyePose[e];
+        const XrQuaternionf eyeInverse{-eyePose.orientation.x, -eyePose.orientation.y, -eyePose.orientation.z, eyePose.orientation.w};
+        const Tangents& t = head.eye[e];
+        float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
+        for (int c = 0; c < 4; ++c) {
+            const XrVector3f corner{(c & 1) ? halfWidthM : -halfWidthM, (c & 2) ? halfHeightM : -halfHeightM, -distance};
+            const XrVector3f rotated = QuatRotate(anchor.orientation, corner);
+            const XrVector3f world{anchor.position.x + rotated.x, anchor.position.y + rotated.y, anchor.position.z + rotated.z};
+            const XrVector3f eyeSpace = QuatRotate(eyeInverse, {world.x - eyePose.position.x, world.y - eyePose.position.y,
+                                                                world.z - eyePose.position.z});
+            if (eyeSpace.z > -1e-3f) {
+                if (!worldHud) { note("rejected: panel behind eye"); return false; }
+                // Looking away from the fixed panel: draw the HUD nowhere this frame.
+                for (int k = 0; k < 2; ++k) { eyes[k] = viewport; scissors[k] = plume::RenderRect(0, 0, 0, 0); }
+                return true;
+            }
+            const float tx = eyeSpace.x / -eyeSpace.z, ty = eyeSpace.y / -eyeSpace.z;
+            const float ndcX = (tx - (t.right + t.left) * 0.5f) * 2.0f / (t.right - t.left);
+            const float ndcY = (ty - (t.up + t.down) * 0.5f) * 2.0f / (t.up - t.down);
+            minX = std::min(minX, ndcX); maxX = std::max(maxX, ndcX);
+            minY = std::min(minY, ndcY); maxY = std::max(maxY, ndcY);
+        }
         eyes[e] = viewport;
-        eyes[e].x = float(e) * half + (half - w) * 0.5f;
-        eyes[e].y = (fullHeight - h) * 0.5f;
-        eyes[e].width = w;
-        eyes[e].height = h;
+        eyes[e].x = float(e) * half + (minX + 1.0f) * 0.5f * half;
+        eyes[e].width = (maxX - minX) * 0.5f * half;
+        eyes[e].y = (1.0f - maxY) * 0.5f * fullHeight;
+        eyes[e].height = (maxY - minY) * 0.5f * fullHeight;
         scissors[e] = plume::RenderRect(int32_t(float(e) * half), 0, int32_t(float(e + 1) * half), int32_t(fullHeight));
     }
     return true;
@@ -762,6 +989,7 @@ void SubmitDesktopFrame(plume::RenderTexture* image, uint32_t width, uint32_t he
                         std::vector<plume::RenderCommandSemaphore*>& presentWaits)
 {
     if (!s.session || !image || !width || !height) return;
+    RefreshTunables();
     HandleEvents();
     LogStats();
     if (!s.running) return;
@@ -795,29 +1023,39 @@ void SubmitDesktopFrame(plume::RenderTexture* image, uint32_t width, uint32_t he
         if (XR_SUCCEEDED(x.xrLocateViews(s.session, &locate, &viewState, 2, &viewCount, views)) && viewCount == 2 &&
             (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
             HeadPose head;
-            head.pose.orientation = views[0].pose.orientation;
-            head.pose.position = {(views[0].pose.position.x + views[1].pose.position.x) * 0.5f,
-                (views[0].pose.position.y + views[1].pose.position.y) * 0.5f,
-                (views[0].pose.position.z + views[1].pose.position.z) * 0.5f};
-            for (int e = 0; e < 2; ++e)
+            for (int e = 0; e < 2; ++e) {
+                head.eyePose[e] = views[e].pose;  // each eye keeps its own orientation (canted displays)
                 head.eye[e] = {std::tan(views[e].fov.angleLeft), std::tan(views[e].fov.angleRight),
                                std::tan(views[e].fov.angleUp), std::tan(views[e].fov.angleDown)};
+            }
+            // The head itself (between the eyes, looking forward), from the VIEW space.
+            XrSpaceLocation headLocation{XR_TYPE_SPACE_LOCATION};
+            if (s.view && XR_SUCCEEDED(x.xrLocateSpace(s.view, s.local, locate.displayTime, &headLocation)) &&
+                (headLocation.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+                head.pose = headLocation.pose;
+            } else {
+                head.pose.orientation = views[0].pose.orientation;
+                head.pose.position = {(views[0].pose.position.x + views[1].pose.position.x) * 0.5f,
+                    (views[0].pose.position.y + views[1].pose.position.y) * 0.5f,
+                    (views[0].pose.position.z + views[1].pose.position.z) * 0.5f};
+            }
             head.valid = true;
             // Developer check without a moving headset: LO_VR_FAKE_YAW=<degrees> swings the head
-            // left and right (4 s period) on top of the tracked pose.
+            // left and right (4 s period) on top of the tracked pose; the eyes turn with it.
             static const float fakeYaw = [] { const char* v = getenv("LO_VR_FAKE_YAW"); return v ? float(atof(v)) : 0.0f; }();
             if (fakeYaw != 0.0f) {
                 const double t = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
                 const float half = float(std::sin(t * 2.0 * 3.14159265 / 4.0)) * fakeYaw * 3.14159265f / 360.0f;
-                const XrQuaternionf q = head.pose.orientation, y{0, std::sin(half), 0, std::cos(half)};
-                head.pose.orientation = {y.w * q.x + y.x * q.w + y.y * q.z - y.z * q.y,
-                                         y.w * q.y - y.x * q.z + y.y * q.w + y.z * q.x,
-                                         y.w * q.z + y.x * q.y - y.y * q.x + y.z * q.w,
-                                         y.w * q.w - y.x * q.x - y.y * q.y - y.z * q.z};
-            }
-            for (int e = 0; e < 2; ++e) {
-                head.eyePose[e] = views[e].pose;
-                head.eyePose[e].orientation = head.pose.orientation;  // includes any developer fake yaw
+                const XrQuaternionf y{0, std::sin(half), 0, std::cos(half)};
+                const XrVector3f centre = head.pose.position;
+                head.pose.orientation = QuatMul(y, head.pose.orientation);
+                for (int e = 0; e < 2; ++e) {
+                    const XrVector3f offset{head.eyePose[e].position.x - centre.x, head.eyePose[e].position.y - centre.y,
+                                            head.eyePose[e].position.z - centre.z};
+                    const XrVector3f turned = QuatRotate(y, offset);
+                    head.eyePose[e].position = {centre.x + turned.x, centre.y + turned.y, centre.z + turned.z};
+                    head.eyePose[e].orientation = QuatMul(y, head.eyePose[e].orientation);
+                }
             }
             const std::scoped_lock lock(g_poseMutex);
             g_latest = head;
@@ -828,15 +1066,19 @@ void SubmitDesktopFrame(plume::RenderTexture* image, uint32_t width, uint32_t he
     // scaling); fall back to the finished desktop image (host menus, no game frame).
     auto* source = static_cast<plume::VulkanTexture*>(image);
     VkImageLayout sourceLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    uint32_t sourcePoseSerial = 0;
     {
         const std::scoped_lock lock(g_sourceMutex);
-        if (g_source.texture && g_source.frames == s.frames) {
+        if (g_source.frames == s.frames) sourcePoseSerial = g_source.poseSerial;
+        if (g_source.texture && g_source.frames == s.frames && !g_hostMenu.load(std::memory_order_relaxed)) {
             auto* frame = static_cast<plume::VulkanTexture*>(g_source.texture);
             const VkImageLayout layout = ToVkLayout(frame->textureLayout);
             // Only when it is larger than the desktop image (an internal resolution
             // above the window). TODO: a Vulkan device loss was seen once with a
             // 1280x720 frame source; investigate before relying on this path.
-            if (layout != VK_IMAGE_LAYOUT_UNDEFINED && g_source.width > width && g_source.height > height) {
+            const bool planned = g_source.width == g_plannedWidth.load(std::memory_order_relaxed) &&
+                                 g_source.height == g_plannedHeight.load(std::memory_order_relaxed);
+            if (layout != VK_IMAGE_LAYOUT_UNDEFINED && (planned || (g_source.width > width && g_source.height > height))) {
                 source = frame;
                 sourceLayout = layout;
                 width = g_source.width;
@@ -845,13 +1087,27 @@ void SubmitDesktopFrame(plume::RenderTexture* image, uint32_t width, uint32_t he
         }
         g_source.texture = nullptr;
     }
+    // Mono/stereo show the desktop image (host menu) on its own swapchain of its own size: the
+    // game frame's swapchain is eye size x2 wide, and a quad layer on a subrectangle of an
+    // 11144-wide image stopped the GPU on a real headset (VR resolution 140%).
+    Swapchain& chain = (RequestedMode() != Mode::Theater && source == static_cast<plume::VulkanTexture*>(image)) ? s.desk : s.quad;
+    // HUD position "Fixed in space": this frame's HUD layer (stereo, not under a host menu).
+    FrameSource hudSource;
+    {
+        const std::scoped_lock lock(g_sourceMutex);
+        if (g_hudSource.texture && g_hudSource.frames == s.frames && HudLayerActive() && !g_hostMenu.load(std::memory_order_relaxed))
+            hudSource = g_hudSource;
+        g_hudSource.texture = nullptr;
+    }
+    bool hudAcquired = false;
+    XrCompositionLayerQuad hudQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     XrCompositionLayerProjectionView projectionViews[2] = {};
-    const XrCompositionLayerBaseHeader* layers[1] = {};
+    const XrCompositionLayerBaseHeader* layers[2] = {};
     uint32_t layerCount = 0;
 
-    if (frameState.shouldRender && EnsureQuadSwapchain(width, height, source->imageFormat)) {
+    if (frameState.shouldRender && EnsureQuadSwapchain(chain, width, height, source->imageFormat)) {
         auto& slot = s.slots[s.slot];
         s.slot = (s.slot + 1) % s.slots.size();
         vkWaitForFences(s.device->vk, 1, &slot.fence, VK_TRUE, UINT64_MAX);
@@ -864,11 +1120,11 @@ void SubmitDesktopFrame(plume::RenderTexture* image, uint32_t width, uint32_t he
         bool acquired;
         {
             const std::scoped_lock lock(*s.queue->queue->mutex);
-            acquired = Check(x.xrAcquireSwapchainImage(s.quad.handle, &acquire, &index), "xrAcquireSwapchainImage");
+            acquired = Check(x.xrAcquireSwapchainImage(chain.handle, &acquire, &index), "xrAcquireSwapchainImage");
         }
         if (acquired &&
-            Check(x.xrWaitSwapchainImage(s.quad.handle, &wait), "xrWaitSwapchainImage")) {
-            const VkImage target = s.quad.images[index].image;
+            Check(x.xrWaitSwapchainImage(chain.handle, &wait), "xrWaitSwapchainImage")) {
+            const VkImage target = chain.images[index].image;
             VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
             begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             vkResetCommandBuffer(slot.commands, 0);
@@ -907,6 +1163,41 @@ void SubmitDesktopFrame(plume::RenderTexture* image, uint32_t width, uint32_t he
             back[1].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             vkCmdPipelineBarrier(slot.commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
                 0, nullptr, 0, nullptr, 2, back);
+            if (hudSource.texture) {
+                auto* hud = static_cast<plume::VulkanTexture*>(hudSource.texture);
+                const VkImageLayout hudLayout = ToVkLayout(hud->textureLayout);
+                uint32_t hudIndex = 0;
+                if (hudLayout != VK_IMAGE_LAYOUT_UNDEFINED && EnsureHudSwapchain(hudSource.width, hudSource.height, hud->imageFormat)) {
+                    {
+                        const std::scoped_lock lock(*s.queue->queue->mutex);
+                        hudAcquired = Check(x.xrAcquireSwapchainImage(s.hud.handle, &acquire, &hudIndex), "xrAcquireSwapchainImage (HUD)");
+                    }
+                    if (hudAcquired && !Check(x.xrWaitSwapchainImage(s.hud.handle, &wait), "xrWaitSwapchainImage (HUD)")) {
+                        XrSwapchainImageReleaseInfo hudRelease{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                        const std::scoped_lock lock(*s.queue->queue->mutex);
+                        x.xrReleaseSwapchainImage(s.hud.handle, &hudRelease);
+                        hudAcquired = false;
+                    }
+                }
+                if (hudAcquired) {
+                    VkImageMemoryBarrier hudCopy[2] = {toCopy[0], toCopy[1]};
+                    hudCopy[0].oldLayout = hudLayout;
+                    hudCopy[0].image = hud->vk;
+                    hudCopy[1].image = s.hud.images[hudIndex].image;
+                    vkCmdPipelineBarrier(slot.commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                        0, nullptr, 0, nullptr, 2, hudCopy);
+                    VkImageCopy hudRegion = region;
+                    hudRegion.extent = {hudSource.width, hudSource.height, 1};
+                    vkCmdCopyImage(slot.commands, hud->vk, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.hud.images[hudIndex].image,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &hudRegion);
+                    VkImageMemoryBarrier hudBack[2] = {back[0], back[1]};
+                    hudBack[0].newLayout = hudLayout;
+                    hudBack[0].image = hud->vk;
+                    hudBack[1].image = s.hud.images[hudIndex].image;
+                    vkCmdPipelineBarrier(slot.commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+                        0, nullptr, 0, nullptr, 2, hudBack);
+                }
+            }
             vkEndCommandBuffer(slot.commands);
 
             auto* semaphore = static_cast<plume::VulkanCommandSemaphore*>(slot.presentSemaphore.get());
@@ -930,16 +1221,32 @@ void SubmitDesktopFrame(plume::RenderTexture* image, uint32_t width, uint32_t he
             XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             {
                 const std::scoped_lock lock(*s.queue->queue->mutex);
-                x.xrReleaseSwapchainImage(s.quad.handle, &release);
+                x.xrReleaseSwapchainImage(chain.handle, &release);
+                if (hudAcquired) x.xrReleaseSwapchainImage(s.hud.handle, &release);
             }
 
-            if (RequestedMode() == Mode::Mono || RequestedMode() == Mode::Stereo) {
+            const bool hostMenu = g_hostMenu.load(std::memory_order_relaxed);
+            // A flat frame (comic-panel cutscene) goes on the screen in front of you, 16:9.
+            const bool flatFrame = source != static_cast<plume::VulkanTexture*>(image) && (sourcePoseSerial & FlatFrameBit) != 0;
+            if (!hostMenu && !flatFrame && (RequestedMode() == Mode::Mono || RequestedMode() == Mode::Stereo)) {
                 const bool stereo = RequestedMode() == Mode::Stereo;
+                // The pose this frame was rendered with; the newest built view's pose otherwise
+                // (LO_VR_POSE_MATCH=0 always uses that).
+                static const bool poseMatch = [] { const char* v = getenv("LO_VR_POSE_MATCH"); return !v || v[0] != '0'; }();
                 HeadPose rendered;
+                bool matched = false;
                 {
                     const std::scoped_lock lock(g_poseMutex);
                     rendered = g_rendered;
+                    if (poseMatch && sourcePoseSerial)
+                        for (const PoseRecord& record : g_poseRecords)
+                            if (record.serial == sourcePoseSerial && record.pose.valid) { rendered = record.pose; matched = true; break; }
                 }
+                static uint64_t matchedFrames = 0, totalFrames = 0;
+                ++totalFrames; if (matched) ++matchedFrames;
+                if (totalFrames == 600 || totalFrames % 18000 == 0)
+                    LOG_NOTICE("vr: frames submitted with their own render pose {}/{} (newest serial {}, frame serial {})",
+                        matchedFrames, totalFrames, g_poseSerial, sourcePoseSerial);
                 if (rendered.valid) {
                     const XrFovf monoFov = ToFov(MonoTangents(rendered));
                     const int32_t half = int32_t(width / 2);
@@ -947,7 +1254,7 @@ void SubmitDesktopFrame(plume::RenderTexture* image, uint32_t width, uint32_t he
                         projectionViews[e] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
                         projectionViews[e].pose = stereo ? rendered.eyePose[e] : rendered.pose;
                         projectionViews[e].fov = stereo ? ToFov(rendered.eye[e]) : monoFov;
-                        projectionViews[e].subImage.swapchain = s.quad.handle;
+                        projectionViews[e].subImage.swapchain = chain.handle;
                         // Stereo: the game drew the left eye into the left half, the right eye into the right half.
                         projectionViews[e].subImage.imageRect = stereo
                             ? XrRect2Di{{e == 0 ? 0 : half, 0}, {half, int32_t(height)}}
@@ -958,15 +1265,31 @@ void SubmitDesktopFrame(plume::RenderTexture* image, uint32_t width, uint32_t he
                     projection.views = projectionViews;
                     layers[0] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection);
                     layerCount = 1;
+                    if (hudAcquired && stereo) {
+                        // A flat panel straight ahead of the recentred view, HUD size wide at HUD distance;
+                        // the layer holds premultiplied colour (transparent where the game drew nothing).
+                        const float degrees = g_tunables.hudDegrees.load(std::memory_order_relaxed);
+                        const float distance = g_tunables.hudDistance.load(std::memory_order_relaxed);
+                        const float panelWidth = 2.0f * distance * std::tan(degrees * 0.5f * 3.14159265f / 180.0f);
+                        hudQuad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                        hudQuad.space = s.local;
+                        hudQuad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                        hudQuad.subImage.swapchain = s.hud.handle;
+                        hudQuad.subImage.imageRect = {{0, 0}, {int32_t(hudSource.width), int32_t(hudSource.height)}};
+                        hudQuad.pose.orientation.w = 1.0f;
+                        hudQuad.pose.position = {0.0f, 0.0f, -distance};
+                        hudQuad.size = {panelWidth, panelWidth * 9.0f / 16.0f};
+                        layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&hudQuad);
+                    }
                 }
             } else {
             quad.space = s.local;
             quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-            quad.subImage.swapchain = s.quad.handle;
+            quad.subImage.swapchain = chain.handle;
             quad.subImage.imageRect = {{0, 0}, {int32_t(width), int32_t(height)}};
             quad.pose.orientation.w = 1.0f;
             quad.pose.position = {0.0f, 0.0f, -s.distance};
-            quad.size = {s.width, s.width * float(height) / float(width)};
+            quad.size = {s.width, s.width * (flatFrame ? 9.0f / 16.0f : float(height) / float(width))};
             layers[0] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
             layerCount = 1;
             }
@@ -996,6 +1319,8 @@ void Shutdown()
 {
     if (s.device && s.queue) vkQueueWaitIdle(s.queue->queue->vk);
     DestroySwapchain(s.quad);
+    DestroySwapchain(s.desk);
+    DestroySwapchain(s.hud);
     if (s.pool) {
         for (auto& slot : s.slots) {
             if (slot.fence) vkDestroyFence(s.device->vk, slot.fence, nullptr);

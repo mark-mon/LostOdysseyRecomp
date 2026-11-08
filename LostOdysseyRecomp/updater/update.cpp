@@ -153,7 +153,7 @@ bool IsSafePayloadPath(const std::filesystem::path &path, std::string &error)
     }
     auto first = Lower(PathUtf8(*path.begin()));
     static const std::set<std::string> mutableNames = {
-        "save", "profile", "cache", "logs", "captures", "game", "settings.ini", "game-path.txt"
+        "save", "profile", "cache", "logs", "captures", "game", "settings.ini", "game-path.txt", "save-path.txt"
     };
     if (mutableNames.contains(first))
     {
