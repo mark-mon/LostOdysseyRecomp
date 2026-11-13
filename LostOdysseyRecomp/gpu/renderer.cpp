@@ -11896,7 +11896,9 @@ void main()
                 scissor.left = std::clamp(scissor.left, 0, int32_t(rasterTarget->guestWidth)); scissor.right = std::clamp(scissor.right, 0, int32_t(rasterTarget->guestWidth));
                 scissor.top = std::clamp(scissor.top, 0, int32_t(rasterTarget->guestHeight)); scissor.bottom = std::clamp(scissor.bottom, 0, int32_t(rasterTarget->guestHeight));
                 toneCheck(8);
-                if (vrClip.right > vrClip.left) {
+                // A target that ends before the view's rectangle begins is a view-sized scratch surface
+                // (e.g. a quarter-size downsample at the origin), not the side-by-side scene: not clipped.
+                if (vrClip.right > vrClip.left && int32_t(rasterTarget->guestWidth) > vrClip.left) {
                     scissor.left = std::max(scissor.left, vrClip.left); scissor.top = std::max(scissor.top, vrClip.top);
                     scissor.right = std::min(scissor.right, vrClip.right); scissor.bottom = std::min(scissor.bottom, vrClip.bottom);
                     if (scissor.right <= scissor.left || scissor.bottom <= scissor.top) return;  // outside this view
@@ -14837,7 +14839,8 @@ void main()
                 // so that part is filled from the other eye's own latest resolve of the same surface
                 // (the same scene a frame earlier: real stereo), or with this eye's picture.
                 uint32_t vrDuplicateWidth = 0;
-                if (vrClip.right > vrClip.left) {
+                // (A surface that ends before the view's rectangle is a scratch target: not clipped.)
+                if (vrClip.right > vrClip.left && int32_t(x1) > vrClip.left) {
                     if (vrClip.left == 0 && vrClip.top == 0 && x0 == 0 && x1 > uint32_t(vrClip.right) && !(copyControl & 0x300))
                         vrDuplicateWidth = uint32_t(vrClip.right);
                     x0 = std::max<uint32_t>(x0, uint32_t(std::max(vrClip.left, 0))); y0 = std::max<uint32_t>(y0, uint32_t(std::max(vrClip.top, 0)));
@@ -14922,8 +14925,10 @@ void main()
                                 commandList->copyTextureRegion(RenderTextureCopyLocation::Subresource(rs.tex->texture.get()),
                                     RenderTextureCopyLocation::Subresource(source.texture.get()), dx, sy, 0, &box);
                             }
-                            LOG_NOTICE("renderer: VR menu backdrop {:#x}: other eye from {}", destBase,
-                                otherEye ? fmt::format("its own resolve {:#x}", vrLaterViewResolves[surfaceKey].destBase) : std::string("this eye's picture"));
+                            static std::set<std::pair<uint32_t, bool>> loggedBackdrops;
+                            if (loggedBackdrops.size() < 32 && loggedBackdrops.insert({destBase, otherEye != nullptr}).second)
+                                LOG_NOTICE("renderer: VR menu backdrop {:#x}: other eye from {}", destBase,
+                                    otherEye ? fmt::format("its own resolve {:#x}", vrLaterViewResolves[surfaceKey].destBase) : std::string("this eye's picture"));
                             Transition(*rs.tex, RenderTextureLayout::SHADER_READ, RenderBarrierStage::GRAPHICS);
                             if (otherEye) Transition(*otherEye, RenderTextureLayout::SHADER_READ, RenderBarrierStage::GRAPHICS);
                             consecutiveResolveCopies.Invalidate();
@@ -15355,13 +15360,112 @@ void main()
         }
     }
 
+    // VR stereo: the game's post-processing runs each depth group for every view in turn
+    // (xr/vr_stereo.cpp), but some effects use a texture an earlier effect left bound (the rain
+    // blur's mask in fetch slot 1 is the rain proxy's). In a flat frame that earlier effect ran
+    // just before; for the second view it is the first view's last draw (the tone map's scene
+    // texture) instead. So the first view's draws record their texture fetch constants, and a
+    // second-view draw of the same shaders whose slot still holds what the first view left
+    // behind, where the first view's draw had inherited its value from before the group, gets
+    // the first view's value for that draw (restored after it). LO_VR_STALE_FETCH_FIX=0 disables.
+    namespace stale_fetch
+    {
+        constexpr uint32_t kSlots = 16;  // texture slots 0-15; the top of the bank holds vertex fetches
+        constexpr uint32_t kWords = kSlots * 6;
+        struct Record { uint64_t vs, ps; std::array<uint32_t, kWords> fetch; };
+        enum class Phase { None, First, FirstDone, Second };
+        Phase phase = Phase::None;
+        std::array<uint32_t, kWords> start{}, end{};
+        std::vector<Record> first;
+        std::vector<uint8_t> secondUsed;
+
+        bool Enabled()
+        {
+            static const bool on = [] { const char* v = getenv("LO_VR_STALE_FETCH_FIX"); return !v || v[0] != '0'; }();
+            return on;
+        }
+
+        bool inViewClip = false;  // between a stereo view's clip packets (its post-processing)
+
+        void OnClip(int32_t left, int32_t right)
+        {
+            inViewClip = right > left;
+            if (!Enabled()) return;
+            if (right > left && left == 0) {
+                phase = Phase::First;
+                g_commandProcessor.ReadRegisters(REG_FETCH_CONSTANTS, kWords, start.data());
+                first.clear();
+            } else if (right > left) {
+                phase = phase == Phase::FirstDone ? Phase::Second : Phase::None;
+                secondUsed.assign(first.size(), 0);
+            } else if (phase == Phase::First) {
+                g_commandProcessor.ReadRegisters(REG_FETCH_CONSTANTS, kWords, end.data());
+                phase = Phase::FirstDone;
+            } else {
+                phase = Phase::None;
+            }
+        }
+
+        // Registers to restore after the draw (empty when nothing was changed).
+        std::vector<std::pair<uint32_t, uint32_t>> BeforeDraw()
+        {
+            std::vector<std::pair<uint32_t, uint32_t>> restore;
+            if (phase != Phase::First && phase != Phase::Second) return restore;
+            const uint64_t vs = g_commandProcessor.GetActiveShaderByteHash(false);
+            const uint64_t ps = g_commandProcessor.GetActiveShaderByteHash(true);
+            std::array<uint32_t, kWords> now;
+            g_commandProcessor.ReadRegisters(REG_FETCH_CONSTANTS, kWords, now.data());
+            if (phase == Phase::First) {
+                if (first.size() < 4096) first.push_back({vs, ps, now});
+                return restore;
+            }
+            // The n-th draw of these shaders in the second view matches the first view's n-th.
+            const Record* match = nullptr;
+            for (size_t i = 0; i < first.size(); ++i) {
+                if (first[i].vs != vs || first[i].ps != ps || secondUsed[i]) continue;
+                secondUsed[i] = 1;
+                match = &first[i];
+                break;
+            }
+            if (!match) return restore;
+            for (uint32_t slot = 0; slot < kSlots; ++slot) {
+                const uint32_t w = slot * 6;
+                auto same = [&](const uint32_t* a, const uint32_t* b) { return std::equal(a + w, a + w + 6, b + w); };
+                if (same(now.data(), match->fetch.data())) continue;
+                if (!same(now.data(), end.data()) || !same(match->fetch.data(), start.data())) continue;
+                for (uint32_t k = 0; k < 6; ++k) {
+                    restore.emplace_back(REG_FETCH_CONSTANTS + w + k, now[w + k]);
+                    g_commandProcessor.WriteRegister(REG_FETCH_CONSTANTS + w + k, match->fetch[w + k]);
+                }
+                static std::set<uint64_t> logged;
+                if (logged.size() < 32 && logged.insert(vs * 31 + ps * 7 + slot).second)
+                    LOG_NOTICE("vr: second view draw vs {:016x} ps {:016x}: fetch slot {} as the first view's", vs, ps, slot);
+            }
+            return restore;
+        }
+    }
+
     void Draw(const DrawInfo& info)
     {
         if (g_renderer) {
             // Includes resolve packets (RB_MODECONTROL == 6), so a native menu
             // cannot overwrite the frontbuffer before the opening snapshot.
             video::CaptureCalibrationSceneBeforeDraw();
+            // The memory sequences' dream filter (Kaim's "recalls a memory" scenes) samples the whole
+            // scene picture over one view: in stereo each eye shows both eyes' pictures squeezed side by
+            // side, then again from that (tiled strips). Not drawn in a stereo view; the frame keeps its
+            // plain picture. LO_VR_MEMORY_FILTER=1 keeps it.
+            static const bool keepMemoryFilter = [] { const char* v = getenv("LO_VR_MEMORY_FILTER"); return v && v[0] == '1'; }();
+            if (!keepMemoryFilter && stale_fetch::inViewClip &&
+                g_commandProcessor.GetActiveShaderByteHash(false) == 0x81217dc973d5dc31ull &&
+                g_commandProcessor.GetActiveShaderByteHash(true) == 0x032289988b9d826eull) {
+                static bool logged = false;
+                if (!logged) { logged = true; LOG_NOTICE("vr: memory dream filter skipped in stereo"); }
+                return;
+            }
+            const auto restore = stale_fetch::BeforeDraw();
             g_renderer->Draw(info);
+            for (const auto& [index, value] : restore) g_commandProcessor.WriteRegister(index, value);
         }
     }
 
@@ -16481,6 +16585,7 @@ void main()
     {
 #ifdef LO_GPU_PLUME
         if (g_renderer) g_renderer->vrClip = {left, top, right, bottom};
+        stale_fetch::OnClip(left, right);
 #endif
     }
 

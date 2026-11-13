@@ -377,6 +377,24 @@ uint32_t vr::AdjustPostQuad(double& x, double& y, double width, double height,
     return 0;
 }
 
+// The game's screen blur (post-process proxy vtable 82003BD4, render 823EB710: the rain's blur
+// overlay). It downsamples the frame into a quarter-size
+// surface and blends it back by screen position; in stereo the second eye reads the first eye's
+// downsample region (right eye blurred and sliding in the rain). Not
+// drawn in VR stereo; LO_VR_SCREEN_BLUR=1 keeps it.
+extern "C" PPC_FUNC(__imp__sub_823EB710);
+PPC_FUNC(sub_823EB710)
+{
+    static const bool keep = [] { const char* v = getenv("LO_VR_SCREEN_BLUR"); return v && v[0] == '1'; }();
+    if (!keep && vr::StereoViewsActive() && !g_flatFrame) {
+        static bool logged = false;
+        if (!logged) { logged = true; LOG_NOTICE("vr: game screen blur skipped in stereo"); }
+        ctx.r3.u64 = 0;
+        return;
+    }
+    __imp__sub_823EB710(ctx, base);
+}
+
 PPC_FUNC(sub_823E2A08)
 {
     // Hand the head pose of this frame's views to the GPU thread in command order.
@@ -415,7 +433,22 @@ PPC_FUNC(sub_823E2A08)
                 sub_823E2B28(call, base);
                 started = true;
             }
+            if (group == 4 && getenv("LO_VR_VIEW_LOG")) {
+                static std::set<std::array<uint32_t, 4>> seen;
+                const std::array<uint32_t, 4> key{uint32_t(v), LoadWord(proxy), LoadWord(proxy + 4), LoadWord(view + 0x1D4)};
+                if (seen.size() < 64 && seen.insert(key).second)
+                    LOG_NOTICE("vr: post group 4 view {} proxy vtable {:08x} flags {:08x} view+0x1D4 {}", v, key[1], key[2], int32_t(key[3]));
+            }
             if (group == 4 && int32_t(LoadWord(view + 0x1D4)) > 0) StoreWord(proxy + 4, LoadWord(proxy + 4) & ~0x10000000u);
+            // The memory sequences' afterimage effect (proxy vtable 820036FC, Kaim's "recalls a memory"
+            // scenes): in stereo it draws the frame as tiled strips across both eyes. Not drawn in VR
+            // stereo; LO_VR_MEMORY_EFFECT=1 keeps it.
+            static const bool keepMemory = [] { const char* e = getenv("LO_VR_MEMORY_EFFECT"); return e && e[0] == '1'; }();
+            if (!keepMemory && !g_flatFrame && LoadWord(proxy) == 0x820036FCu) {
+                static bool logged = false;
+                if (!logged) { logged = true; LOG_NOTICE("vr: memory afterimage effect skipped in stereo"); }
+                continue;
+            }
             if (!clipped) {
                 // FViewInfo's integer render-target rectangle: +0x2C X, +0x30 Y, +0x34 SizeX, +0x38 SizeY.
                 static const bool originFix = [] { const char* e = getenv("LO_VR_POST_ORIGIN_FIX"); return !e || e[0] != '0'; }();

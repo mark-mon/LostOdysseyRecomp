@@ -1828,8 +1828,11 @@ void Publish(uint8_t *base, uint32_t config)
     if (tab == 4 && status.empty())
     {
         if (row == VrModeRow)
-            next.help = Tr(L"Play in a headset through OpenXR (SteamVR or another runtime running). Theater: a screen in front of you; Mono: head tracking; Stereo: each eye rendered. Applies after restart.",
-                           L"透過 OpenXR 在頭戴裝置中遊玩（需執行 SteamVR 等）。劇院：面前的螢幕；單眼：頭部追蹤；立體：分別繪製雙眼。重新啟動後套用。");
+            next.help = edit.graphicsBackend != GraphicsBackend::Vulkan
+                ? Tr(L"VR needs the Vulkan backend: set Graphics -> Backend to Vulkan. With another backend VR stays off.",
+                     L"VR 需要 Vulkan 後端：請將 圖形 -> 後端 設為 Vulkan。使用其他後端時 VR 保持關閉。")
+                : Tr(L"Play in a headset through OpenXR (SteamVR or another runtime running). Theater: a screen in front of you; Mono: head tracking; Stereo: each eye rendered. Applies after restart.",
+                     L"透過 OpenXR 在頭戴裝置中遊玩（需執行 SteamVR 等）。劇院：面前的螢幕；單眼：頭部追蹤；立體：分別繪製雙眼。重新啟動後套用。");
         if (row == VrResolutionRow)
             next.help = Tr(L"Render size per eye, as a share of the headset's recommended size (SteamVR's own resolution setting included). Replaces Render resolution. Applies after saving.",
                            L"每眼渲染大小，相對於頭戴裝置建議大小（含 SteamVR 解析度設定）。取代渲染解析度。儲存後套用。");

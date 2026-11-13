@@ -7,6 +7,7 @@
 #include <os/logger.h>
 #include <kernel/memory.h>
 #include <settings/config.h>
+#include <gpu/backend_selection.h>
 
 #if defined(LO_GPU_PLUME) && (defined(_WIN32) || defined(__linux__)) && !defined(__ANDROID__)
 #define LO_VR_VULKAN 1
@@ -46,7 +47,15 @@ Mode RequestedMode()
         LOG_WARNING("vr: unknown LO_VR value '{}'; VR stays off", text);
         return Mode::Off;
     }();
-    return mode;
+    // VR output is Vulkan only (OpenXR Vulkan session on the renderer's device).
+    static const Mode effective = [] {
+        if (mode == Mode::Off) return mode;
+        const auto backend = gpu::backend::Requested(settings::GetConfig().graphicsBackend, getenv("LO_GRAPHICS_API"));
+        if (backend && *backend == gpu::backend::Backend::Vulkan) return mode;
+        LOG_WARNING("vr: VR needs the Vulkan backend (Settings -> Graphics -> Backend); VR is off this run");
+        return Mode::Off;
+    }();
+    return effective;
 }
 
 #if !LO_VR_VULKAN
