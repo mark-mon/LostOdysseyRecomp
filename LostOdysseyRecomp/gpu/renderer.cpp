@@ -3077,6 +3077,8 @@ namespace gpu::renderer
                     "        return ori;\n"
                     "#endif\n"
                     "    }\n"
+                    "    // Mode 3: raw copy from the source pixel offset by xeTransfer.xy (VR eye crop).\n"
+                    "    if (xeTransfer.z == 3) return src.Load(int3(p + int2(int(xeTransfer.x), int(xeTransfer.y)), 0));\n"
                     "    // Mode 1: gamma-encode a linear picture (VR menu backdrop's other eye).\n"
                     "    if (xeTransfer.z == 1) return float4(pow(saturate(ori.rgb), asfloat(xeTransfer.w)), ori.a);\n"
                     "    const float strength = asfloat(xeTransfer.x), sharpClamp = asfloat(xeTransfer.y);\n"
@@ -3374,6 +3376,211 @@ namespace gpu::renderer
             // VR stereo (gpu/vr_clip.h): guest rectangle of the view whose post-processing is being
             // drawn; draws and resolve clears stay inside it. Empty (right <= left) when off.
             RenderRect vrClip{0, 0, 0, 0};
+            // Inside that view's post-processing, the game's post-process quad helper is drawing
+            // (gpu/vr_clip.h PostQuadBegin).
+            bool vrPostQuad = false;
+            uint32_t vrPostProxy = 0;  // gpu/vr_clip.h PostProxyBegin
+            // This view's eye view-projection and the game's own (gpu/vr_clip.h ViewMatricesBegin).
+            float vrEyeVP[16]{}, vrGameVP[16]{};
+            bool vrViewMatrices = false;
+            // This draw samples a picture through VrEyeCrop.
+            bool vrCropDraw = false;
+
+            // VR stereo, with VrEyeCrop: the effect is a screen material on a mesh the game placed to fill
+            // its flat screen (texture coordinates 0..1 across it). Drawn with the eye's view-projection,
+            // the mesh sits off the eye's screen by the eye's offset and frustum, so the eye's picture
+            // lands shifted (double image). Drawn with the game's own view-projection it fills the eye's
+            // viewport exactly and each pixel samples its own place. The vertex constants holding a
+            // matrix M = World x eyeVP (World affine; the view-projection alone or with the object's
+            // transform, rows or columns, any component order) become M x inverse(eyeVP) x gameVP.
+            // A run of four registers is taken as such a matrix when M x inverse(eyeVP) is affine.
+            bool ReplaceVrViewProjection(uint32_t* constants)
+            {
+                double inv[16];
+                if (!Invert4(vrEyeVP, inv)) return false;
+                double x[16]{};  // inverse(eyeVP) x gameVP
+                for (int i = 0; i < 4; ++i)
+                    for (int j = 0; j < 4; ++j)
+                        for (int k = 0; k < 4; ++k) x[i * 4 + j] += inv[i * 4 + k] * double(vrGameVP[k * 4 + j]);
+                auto reg = [&](int r, int k) { return double(std::bit_cast<float>(constants[r * 4 + k])); };
+                bool replaced = false;
+                for (int r = 0; r + 4 <= 256; ++r) {
+                    // Rows: clip = pos x M, each register a row of M. Each row times inverse(eyeVP) must end
+                    // in 0 (direction rows) or 1 (the translation row), exactly one 1.
+                    // Tolerances follow the size of the summed terms (float constants, large world offsets).
+                    int ones = 0;
+                    bool rows = true;
+                    for (int j = 0; j < 4 && rows; ++j) {
+                        double w = 0.0, terms = 0.0, magnitude = 0.0;
+                        for (int k = 0; k < 4; ++k) {
+                            w += reg(r + j, k) * inv[k * 4 + 3];
+                            terms += std::abs(reg(r + j, k) * inv[k * 4 + 3]);
+                            magnitude = std::max(magnitude, std::abs(reg(r + j, k)));
+                        }
+                        const double tolerance = 1e-4 * terms + 1e-5;
+                        if (magnitude < 1e-6) rows = false;
+                        else if (std::abs(w - 1.0) <= tolerance) ++ones;
+                        else if (std::abs(w) > tolerance) rows = false;
+                    }
+                    if (rows && ones == 1) {
+                        for (int j = 0; j < 4; ++j)
+                            for (int c = 0; c < 4; ++c) {
+                                double v = 0.0;
+                                for (int k = 0; k < 4; ++k) v += reg(r + j, k) * x[k * 4 + c];
+                                constants[(r + j) * 4 + c] = std::bit_cast<uint32_t>(float(v));
+                            }
+                        replaced = true;
+                        r += 3;
+                        continue;
+                    }
+                    // Columns: clip component i = dot(pos, register perm[i]). M[k][i] = register perm[i] [k];
+                    // column 3 of M x inverse(eyeVP) must be (0, 0, 0, 1).
+                    int perm[4]{0, 1, 2, 3};
+                    bool columns = false;
+                    do {
+                        bool ok = true;
+                        double any = 0.0;
+                        for (int k = 0; k < 4 && ok; ++k) {
+                            double w = 0.0, terms = 0.0;
+                            for (int i = 0; i < 4; ++i) {
+                                w += reg(r + perm[i], k) * inv[i * 4 + 3];
+                                terms += std::abs(reg(r + perm[i], k) * inv[i * 4 + 3]);
+                                any = std::max(any, std::abs(reg(r + perm[i], k)));
+                            }
+                            const double tolerance = 1e-4 * terms + 1e-5;
+                            ok = k == 3 ? std::abs(w - 1.0) <= tolerance : std::abs(w) <= tolerance;
+                        }
+                        ok = ok && any > 1e-6;
+                        columns = ok;
+                    } while (!columns && std::next_permutation(perm, perm + 4));
+                    if (!columns) continue;
+                    double m[4][4];
+                    for (int k = 0; k < 4; ++k)
+                        for (int i = 0; i < 4; ++i) m[k][i] = reg(r + perm[i], k);
+                    for (int k = 0; k < 4; ++k)
+                        for (int i = 0; i < 4; ++i) {
+                            double v = 0.0;
+                            for (int q = 0; q < 4; ++q) v += m[k][q] * x[q * 4 + i];
+                            constants[(r + perm[i]) * 4 + k] = std::bit_cast<uint32_t>(float(v));
+                        }
+                    replaced = true;
+                    r += 3;
+                }
+                return replaced;
+            }
+
+            static bool Invert4(const float* source, double* out)
+            {
+                double a[4][8];
+                for (int i = 0; i < 4; ++i)
+                    for (int j = 0; j < 8; ++j) a[i][j] = j < 4 ? double(source[i * 4 + j]) : (j - 4 == i ? 1.0 : 0.0);
+                for (int c = 0; c < 4; ++c) {
+                    int pivot = c;
+                    for (int r = c + 1; r < 4; ++r) if (std::abs(a[r][c]) > std::abs(a[pivot][c])) pivot = r;
+                    if (std::abs(a[pivot][c]) < 1e-12) return false;
+                    if (pivot != c) for (int j = 0; j < 8; ++j) std::swap(a[c][j], a[pivot][j]);
+                    const double d = a[c][c];
+                    for (int j = 0; j < 8; ++j) a[c][j] /= d;
+                    for (int r = 0; r < 4; ++r)
+                        if (r != c && a[r][c] != 0.0) {
+                            const double f = a[r][c];
+                            for (int j = 0; j < 8; ++j) a[r][j] -= f * a[c][j];
+                        }
+                }
+                for (int i = 0; i < 4; ++i)
+                    for (int j = 0; j < 4; ++j) out[i * 4 + j] = a[i][j + 4];
+                return true;
+            }
+
+            // VR stereo, every effect of one kind at once: both eyes are rendered side by side on
+            // one surface, and its resolves hold both eyes. The game's post-process quads sample
+            // such a resolve at their own eye's part (their texture coordinates come from the
+            // view's rectangle). Other effects drawn over one eye inside its post-processing
+            // (cinematic screen materials: the memory sequences' dream filters, warps) sample the
+            // whole resolve as if it were one screen, so each eye showed both eyes squeezed side
+            // by side, and the second eye then that again (tiled strips). For those draws the
+            // resolve is replaced by a copy of this eye's part alone. LO_VR_EYE_CROP=0 disables.
+            std::unique_ptr<HostTexture> vrEyeCrops[2];
+            struct VrEyeCropKey { const RenderTexture* source = nullptr; uint64_t ordinal = 0, frame = ~0ull; } vrEyeCropKeys[2];
+
+            HostTexture* VrEyeCrop(HostTexture& tex, const uint32_t* fetch, const RenderViewport& viewport, const HostTexture* target)
+            {
+                static const bool enabled = [] { const char* v = std::getenv("LO_VR_EYE_CROP"); return !v || v[0] != '0'; }();
+                if (!enabled || vrPostQuad || vrClip.right <= vrClip.left || !target || !tex.texture || !tex.guestWidth) return nullptr;
+                const int32_t eyeWidth = vrClip.right - vrClip.left;
+                // A resolve that holds both eyes: as wide as the whole surface.
+                if (int32_t(tex.guestWidth) < vrClip.right || int32_t(tex.guestWidth) < 2 * eyeWidth - 2) return nullptr;
+                ResolvedSurface* rs = FindResolved((fetch[1] >> 12) << 12, fetch[1] & 0x3F);
+                if (!rs || rs->tex.get() != &tex) return nullptr;
+                // Drawn over one eye (a draw over the whole surface samples the whole resolve rightly).
+                if (viewport.width > double(target->width) * 0.75) return nullptr;
+                const uint32_t eye = vrClip.left > 0 ? 1 : 0;
+                const uint32_t x0 = uint32_t(uint64_t(std::max(vrClip.left, 0)) * tex.width / tex.guestWidth);
+                const uint32_t x1 = std::min<uint32_t>(tex.width, uint32_t(uint64_t(vrClip.right) * tex.width / tex.guestWidth));
+                if (x1 <= x0) return nullptr;
+                auto& crop = vrEyeCrops[eye];
+                auto& key = vrEyeCropKeys[eye];
+                if (crop && key.source == tex.texture.get() && key.ordinal == rs->writeOrdinal && key.frame == frame &&
+                    crop->width == x1 - x0 && crop->height == tex.height && crop->format == tex.format) {
+                    vrCropDraw = true;
+                    vr::NoteEyeCropProxy(vrPostProxy);
+                    return crop.get();
+                }
+                vrCropDraw = true;
+                vr::NoteEyeCropProxy(vrPostProxy);
+                if (!crop || !crop->texture || crop->width != x1 - x0 || crop->height != tex.height || crop->format != tex.format) {
+                    if (crop) Gpu().retiredTextures.push_back(std::move(crop));
+                    crop = std::make_unique<HostTexture>();
+                    crop->allocationSerial = ++nextTargetAllocation;
+                    crop->format = tex.format;
+                    crop->width = x1 - x0;
+                    crop->height = tex.height;
+                    crop->guestWidth = uint32_t(eyeWidth);
+                    crop->guestHeight = tex.guestHeight;
+                    crop->resolutionSize = tex.resolutionSize;
+                    crop->texture = device->createTexture(RenderTextureDesc::Texture2D(crop->width, crop->height, 1, crop->format,
+                        RenderTextureFlag::RENDER_TARGET));
+                    crop->layout = RenderTextureLayout::UNKNOWN;
+                    if (!crop->texture) { crop.reset(); return nullptr; }
+                }
+                RenderPipeline* pipeline = GetSharpenPipeline(*crop);
+                if (!pipeline) return nullptr;
+                SharedConstants constants{};
+                constants.transfer[0] = x0;
+                constants.transfer[1] = 0;
+                constants.transfer[2] = 3;
+                const uint64_t offset = Upload(&constants, sizeof(constants));
+                if (offset == UINT64_MAX || !Begin()) return nullptr;
+                Transition(tex, RenderTextureLayout::SHADER_READ, RenderBarrierStage::GRAPHICS);
+                Transition(*crop, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
+                RenderDescriptorSet* set1 = AcquireSet(1);
+                set1->setTexture(0, tex.texture.get(), RenderTextureLayout::SHADER_READ);
+                BindTargets(crop.get(), nullptr);
+                RenderViewport cropViewport(0.0f, 0.0f, float(crop->width), float(crop->height));
+                commandList->setViewports(&cropViewport, 1);
+                RenderRect rect{0, 0, int32_t(crop->width), int32_t(crop->height)};
+                commandList->setScissors(&rect, 1);
+                commandList->setPipeline(pipeline);
+                commandList->setGraphicsPipelineLayout(pipelineLayout.get());
+                SetConstantBuffer(offset, 0);
+                SetConstantBuffer(offset, 1);
+                SetConstantBuffer(offset, 2);
+                commandList->setGraphicsDescriptorSet(staticSet0.get(), 0);
+                commandList->setGraphicsDescriptorSet(set1, 1);
+                commandList->setGraphicsDescriptorSet(AcquireSet(2), 2);
+                commandList->setGraphicsDescriptorSet(AcquireSet(3), 3);
+                if (vulkan) commandList->setGraphicsDescriptorSet(staticSamplerSet.get(), 4);
+                commandList->drawInstanced(3, 1, 0, 0);
+                Transition(*crop, RenderTextureLayout::SHADER_READ, RenderBarrierStage::GRAPHICS);
+                key = {tex.texture.get(), rs->writeOrdinal, frame};
+                static uint32_t logs = 0;
+                if (logs < 16) {
+                    ++logs;
+                    LOG_NOTICE("vr: eye {} effect samples the both-eyes picture {:#x} ({}x{}): bound to this eye's part ({}..{})",
+                        eye, (fetch[1] >> 12) << 12, tex.width, tex.height, x0, x1);
+                }
+                return crop.get();
+            }
 
             void CompileBlitShaders()
             {
@@ -11517,8 +11724,11 @@ void main()
                         if (!samplerIndex) { failedPlan = true; return; }
                         shared.samplerIndex[slot] = *samplerIndex;
                         samplerKey = ActualSamplerKey(*samplerIndex);
+                        HostTexture* eyeCrop = s == ps && !temporalDisplay && !aoColor && !bloomFiltered && !hdrBinding
+                            ? VrEyeCrop(*tex, fetch, rasterViewport, color) : nullptr;
                         textureBindings[bank][slot] = temporalDisplay ? temporalDisplay : aoColor ? aoColor :
-                            bloomFiltered ? bloomFiltered->texture.get() : hdrBinding ? hdrBinding : tex->texture.get();
+                            bloomFiltered ? bloomFiltered->texture.get() : hdrBinding ? hdrBinding :
+                            eyeCrop ? eyeCrop->texture.get() : tex->texture.get();
                         // Candidate only: a later VS binding or a failed draw
                         // can still replace/cancel it. Confirm after recording.
                         if (traceControllerAtlas && tex->controllerAtlasRecognized &&
@@ -11565,6 +11775,7 @@ void main()
                     }
                 };
                 toneCheck(6);
+                vrCropDraw = false;
                 bindTextures(ps);
                 if (failedPlan)
                     return;
@@ -11675,6 +11886,27 @@ void main()
                 tBind0.AddTo(tBind);
                 render_batch::CpuTimer<> tIndex0(cpuTimingEnabled);
 
+                if (vrCropDraw && vrViewMatrices) {
+                    static const bool keepEyeMatrix = [] { const char* v = std::getenv("LO_VR_EYE_CROP_MATRIX"); return v && v[0] == '0'; }();
+                    if (!keepEyeMatrix) {
+                        const bool replaced = ReplaceVrViewProjection(vsConstants);
+                        if (replaced) drawConstantsModified[0] = true;
+                        static std::set<std::pair<uint64_t, bool>> logged;
+                        if (logged.size() < 32 && logged.insert({key.vs, replaced}).second) {
+                            LOG_NOTICE("vr: eye-cropped effect vs {:016x} ps {:016x}: {}", key.vs, key.ps,
+                                replaced ? "drawn with the game's view-projection" : "no eye view-projection in its constants");
+                            if (!replaced) {
+                                auto f = [&](const uint32_t* v, int i) { return std::bit_cast<float>(v[i]); };
+                                LOG_NOTICE("vr:   eye VP rows [{} {} {} {}] [{} {} {} {}] [{} {} {} {}] [{} {} {} {}]",
+                                    vrEyeVP[0], vrEyeVP[1], vrEyeVP[2], vrEyeVP[3], vrEyeVP[4], vrEyeVP[5], vrEyeVP[6], vrEyeVP[7],
+                                    vrEyeVP[8], vrEyeVP[9], vrEyeVP[10], vrEyeVP[11], vrEyeVP[12], vrEyeVP[13], vrEyeVP[14], vrEyeVP[15]);
+                                for (int r = 0; r < 16; ++r)
+                                    LOG_NOTICE("vr:   c{} [{} {} {} {}]", r, f(vsConstants, r * 4), f(vsConstants, r * 4 + 1),
+                                        f(vsConstants, r * 4 + 2), f(vsConstants, r * 4 + 3));
+                            }
+                        }
+                    }
+                }
                 uint64_t vsOffset = UploadUnchanged(0, vsConstants, sizeof(vsConstants),
                     drawConstantsModified[0] ? 0 : constantGeneration[0]);
                 uint64_t psOffset = UploadUnchanged(1, psConstants, sizeof(psConstants),
@@ -15451,18 +15683,6 @@ void main()
             // Includes resolve packets (RB_MODECONTROL == 6), so a native menu
             // cannot overwrite the frontbuffer before the opening snapshot.
             video::CaptureCalibrationSceneBeforeDraw();
-            // The memory sequences' dream filter (Kaim's "recalls a memory" scenes) samples the whole
-            // scene picture over one view: in stereo each eye shows both eyes' pictures squeezed side by
-            // side, then again from that (tiled strips). Not drawn in a stereo view; the frame keeps its
-            // plain picture. LO_VR_MEMORY_FILTER=1 keeps it.
-            static const bool keepMemoryFilter = [] { const char* v = getenv("LO_VR_MEMORY_FILTER"); return v && v[0] == '1'; }();
-            if (!keepMemoryFilter && stale_fetch::inViewClip &&
-                g_commandProcessor.GetActiveShaderByteHash(false) == 0x81217dc973d5dc31ull &&
-                g_commandProcessor.GetActiveShaderByteHash(true) == 0x032289988b9d826eull) {
-                static bool logged = false;
-                if (!logged) { logged = true; LOG_NOTICE("vr: memory dream filter skipped in stereo"); }
-                return;
-            }
             const auto restore = stale_fetch::BeforeDraw();
             g_renderer->Draw(info);
             for (const auto& [index, value] : restore) g_commandProcessor.WriteRegister(index, value);
@@ -16584,8 +16804,42 @@ void main()
     void SetVrClip(int32_t left, int32_t top, int32_t right, int32_t bottom)
     {
 #ifdef LO_GPU_PLUME
-        if (g_renderer) g_renderer->vrClip = {left, top, right, bottom};
+        if (g_renderer) {
+            g_renderer->vrClip = {left, top, right, bottom};
+            g_renderer->vrPostQuad = false;
+            if (right <= left) { g_renderer->vrViewMatrices = false; g_renderer->vrPostProxy = 0; }
+        }
         stale_fetch::OnClip(left, right);
+#endif
+    }
+
+    void SetVrViewMatrices(const float eye[16], const float game[16])
+    {
+#ifdef LO_GPU_PLUME
+        if (!g_renderer) return;
+        std::memcpy(g_renderer->vrEyeVP, eye, sizeof(g_renderer->vrEyeVP));
+        std::memcpy(g_renderer->vrGameVP, game, sizeof(g_renderer->vrGameVP));
+        g_renderer->vrViewMatrices = true;
+#else
+        (void)eye; (void)game;
+#endif
+    }
+
+    void SetVrPostProxy(uint32_t vtable)
+    {
+#ifdef LO_GPU_PLUME
+        if (g_renderer) g_renderer->vrPostProxy = vtable;
+#else
+        (void)vtable;
+#endif
+    }
+
+    void SetVrPostQuad(bool drawing)
+    {
+#ifdef LO_GPU_PLUME
+        if (g_renderer) g_renderer->vrPostQuad = drawing;
+#else
+        (void)drawing;
 #endif
     }
 

@@ -76,6 +76,9 @@ bool StereoViewsActive();
 // it in the command ring; the GPU thread hands it over with the frame, and the frame is
 // submitted to OpenXR with the pose it was rendered with (no swim when turning the head).
 uint32_t PoseSerialForView(uint32_t view);
+// The game's own view-projection (before the headset's) of a main view built this frame, matched like
+// PoseSerialForView. Row vectors, as the game stores matrices.
+bool GameViewProjectionForView(uint32_t view, float out[16]);
 void SetFramePoseSerial(uint32_t serial);
 // Stereo, game render thread, inside a view's post-processing: the game places its full-view
 // quads (DrawDenormalizedQuad) at the view's origin X/Y, in a target it takes to be the view's
@@ -87,6 +90,15 @@ void SetFramePoseSerial(uint32_t serial);
 uint32_t AdjustPostQuad(double& x, double& y, double width, double height,
                         double& u, double& v, double sizeU, double sizeV,
                         uint32_t stack, const uint32_t* ints = nullptr);
+// Stereo, game render thread: marks the game's post-process quad helper drawing inside a view's
+// post-processing (gpu/vr_clip.h PostQuadBegin, for the renderer's eye crop). Begin returns
+// whether it marked; pass that to End.
+// Renderer (GPU thread): a draw of this post-process proxy (vtable) needed the eye crop (an effect
+// that treats the both-eyes picture as one screen). While such a proxy runs, frames are shown flat
+// (LO_VR_EFFECT_FLAT=0 keeps them in stereo with the eye crop alone).
+void NoteEyeCropProxy(uint32_t vtable);
+bool BeginPostQuadMark();
+void EndPostQuadMark(bool marked);
 // Eye whose FSceneView is being built on this thread (0 left, 1 right, -1 none).
 void SetCurrentEye(int eye);
 

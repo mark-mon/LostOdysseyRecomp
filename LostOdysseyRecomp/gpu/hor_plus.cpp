@@ -440,7 +440,15 @@ PPC_FUNC(sub_823EFC08)
 // FLO_MOVIE is the only call at this helper return address.  Compress its
 // destination into the centred 16:9 safe region; OverlayColor and postprocess
 // calls retain their full-target coverage.
+static void PostQuadHelper(PPCContext& __restrict ctx, uint8_t* base);
 PPC_FUNC(sub_823E4B50)
+{
+    // VR stereo: the renderer must know these quads (see vr::BeginPostQuadMark).
+    const bool marked = vr::StereoViewsActive() && vr::BeginPostQuadMark();
+    PostQuadHelper(ctx, base);
+    vr::EndPostQuadMark(marked);
+}
+static void PostQuadHelper(PPCContext& __restrict ctx, uint8_t* base)
 {
     // VR stereo: post-processing quads of a view off the origin (see vr::AdjustPostQuad).
     if (vr::StereoViewsActive())

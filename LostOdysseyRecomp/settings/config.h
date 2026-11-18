@@ -142,6 +142,7 @@ struct Config
     uint32_t dynamicShadows = 1;
     // View-frustum culling, 0..200 in steps of 10: 100 retail, lower draws
     // objects at the screen edges longer, higher hides them sooner. Applied live.
+    // At most 100 in VR (any mode): above it close-up characters vanish.
     uint32_t cullingPercent = 100;
     // VR through OpenXR (xr/vr.h): 0 Off, 1 Theater, 2 Mono, 3 Stereo. Applied
     // after a restart; the LO_VR environment variable overrides it.
@@ -214,6 +215,12 @@ struct Config
     bool operator==(const Config &) const = default;
 };
 Config GetConfig();
+// VR mono/stereo (this run, or chosen for the next one): the game's depth of field, bloom and
+// motion blur are off, the frame rate is at least 60 and Culling is at most 100%. Those effects work on the whole screen
+// and break the second eye (black or smeared right eye), and 30 FPS judders in a headset.
+bool VrLimitsGameEffects(const Config &config);
+// Any VR mode (theater too) on Vulkan: Culling is at most 100%.
+bool VrLimitsCulling(const Config &config);
 void PreviewConfig(const Config &config);
 // Atomic replacement, preserving the previous file if writing fails.
 bool SaveConfig(const Config &config);

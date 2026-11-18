@@ -147,14 +147,15 @@ PPC_FUNC(sub_82300158)
     // Comic panels in the last few frames: one whole view, shown flat (LO_VR_PANEL_FLAT=0 disables).
     static const bool panelFlat = [] { const char* v = getenv("LO_VR_PANEL_FLAT"); return !v || v[0] != '0'; }();
     ++g_drawCounter;
-    // Battle transition: the warp (the field picture, grabbed whole and drawn into each eye) is shown flat
-    // from the request for LO_VR_BATTLE_FLAT_MS (default 3100; 0: until the battle core runs);
-    // LO_VR_BATTLE_FLAT=0 keeps it in VR. Times are logged (F10 logs a mark relative to the last request).
+    // Battle transition: the warp grabs the whole (both-eyes) field picture and draws it into each eye;
+    // the renderer's eye crop (VrEyeCrop) gives each eye its own part, so it stays in VR. LO_VR_BATTLE_FLAT=1
+    // shows it flat instead, from the request for LO_VR_BATTLE_FLAT_MS (default 3100; 0: until the battle
+    // core runs). Times are logged (F10 logs a mark relative to the last request).
     static const char* battleFlatEnv = getenv("LO_VR_BATTLE_FLAT");
     // The warp is a fixed animation (timed to its sound): marked with F10 at 3082 and 3275 ms after the
     // request (reaction time included); the battle core only runs ~8250 ms after it, past the opening shot.
     static const int64_t battleFlatMs = [] { const char* v = getenv("LO_VR_BATTLE_FLAT_MS"); return v ? int64_t(atoll(v)) : int64_t(3100); }();
-    const bool battleFlat = !battleFlatEnv || battleFlatEnv[0] != '0';
+    const bool battleFlat = battleFlatEnv && battleFlatEnv[0] == '1';
     if (const int64_t requested = g_battleRequestedMs.load(std::memory_order_relaxed); requested) {
         const int64_t elapsed = NowMs() - requested;
         if (debug_menu::CurrentBattle() != 0 || elapsed > 10000) {
@@ -311,6 +312,7 @@ PPC_FUNC(sub_823E2DE8)
 // every view, which overwrote the other eye. Same calls and order as the original.
 extern "C" PPC_FUNC(__imp__sub_823E2A08);
 // sub_823E2B28 is declared by ppc_recomp_shared.h.
+static void EmitViewMatrices(uint32_t view);
 namespace
 {
 void EmitVrClip(float left, float top, float right, float bottom)
@@ -334,6 +336,17 @@ namespace
 {
 // The view origin of the post-processing pass in progress (stereo, game render thread).
 int32_t g_postOffsetX = 0, g_postOffsetY = 0;
+// A view's post-processing is running inside its VR clip (stereo, game render thread).
+bool g_inViewPost = false;
+// Post-process proxies (vtables) whose draws needed the renderer's eye crop (vr::NoteEyeCropProxy).
+std::array<std::atomic<uint32_t>, 16> g_effectProxies{};
+bool IsEffectProxy(uint32_t vtable)
+{
+    if (!vtable) return false;
+    for (const auto& p : g_effectProxies)
+        if (p.load(std::memory_order_relaxed) == vtable) return true;
+    return false;
+}
 // The viewport the game set last (after the fix below), for AdjustPostQuad.
 int32_t g_viewportMinX = 0, g_viewportMaxX = 0;
 }
@@ -351,6 +364,51 @@ PPC_FUNC(sub_823C10F8)
     g_viewportMinX = int32_t(ctx.r4.u32);
     g_viewportMaxX = int32_t(ctx.r7.u32);
     __imp__sub_823C10F8(ctx, base);
+}
+
+// gpu/vr_clip.h ViewMatricesBegin for one view: its view-projection (+0x100) and the game's own.
+static void EmitViewMatrices(uint32_t view)
+{
+    float game[16];
+    if (!vr::GameViewProjectionForView(view, game)) {
+        static bool logged = false;
+        if (!logged) { logged = true; LOG_NOTICE("vr: no game view-projection recorded for a stereo view"); }
+        return;
+    }
+    uint32_t words[gpu::vr_clip::ViewMatricesWordCount];
+    words[0] = gpu::vr_clip::Magic;
+    for (uint32_t i = 0; i < 16; ++i) {
+        words[1 + i] = LoadWord(view + 0x100 + i * 4);
+        words[17 + i] = std::bit_cast<uint32_t>(game[i]);
+    }
+    gpu::frame_plan::EmitPrivatePacket(LoadWord(0x83302A38), gpu::vr_clip::ViewMatricesBegin, words);
+}
+
+void vr::NoteEyeCropProxy(uint32_t vtable)
+{
+    if (!vtable || IsEffectProxy(vtable)) return;
+    for (auto& p : g_effectProxies) {
+        uint32_t empty = 0;
+        if (p.compare_exchange_strong(empty, vtable, std::memory_order_relaxed)) {
+            LOG_NOTICE("vr: post-process proxy {:08x} draws a whole-screen effect: shown flat while it runs", vtable);
+            return;
+        }
+    }
+}
+
+bool vr::BeginPostQuadMark()
+{
+    if (!g_inViewPost) return false;
+    const uint32_t words[gpu::vr_clip::PostQuadWordCount] = {gpu::vr_clip::Magic, 1};
+    gpu::frame_plan::EmitPrivatePacket(LoadWord(0x83302A38), gpu::vr_clip::PostQuadBegin, words);
+    return true;
+}
+
+void vr::EndPostQuadMark(bool marked)
+{
+    if (!marked) return;
+    const uint32_t words[gpu::vr_clip::PostQuadWordCount] = {gpu::vr_clip::Magic, 0};
+    gpu::frame_plan::EmitPrivatePacket(LoadWord(0x83302A38), gpu::vr_clip::PostQuadBegin, words);
 }
 
 uint32_t vr::AdjustPostQuad(double& x, double& y, double width, double height,
@@ -415,6 +473,19 @@ PPC_FUNC(sub_823E2A08)
     if (!clipEnabled || !vr::StereoViewsActive() || !g_memory.base) { __imp__sub_823E2A08(ctx, base); return; }
     const uint32_t sceneRenderer = ctx.r3.u32, group = ctx.r4.u32;
     const int32_t viewCount = int32_t(LoadWord(sceneRenderer + 0x34));
+    // A whole-screen effect learned from the renderer's eye crop is running: show the frames flat while
+    // it does (also checked in flat frames, so the stretch holds). LO_VR_EFFECT_FLAT=0 keeps stereo.
+    static const bool effectFlat = [] { const char* v = getenv("LO_VR_EFFECT_FLAT"); return !v || v[0] != '0'; }();
+    if (effectFlat) {
+        for (int32_t v = 0; v < viewCount && v < 4; ++v) {
+            const uint32_t view = LoadWord(sceneRenderer + 0x30) + uint32_t(v) * 0x6F0;
+            const int32_t proxies = int32_t(LoadWord(view + 0x6B8));
+            for (int32_t i = 0; i < proxies && i < 64; ++i) {
+                const uint32_t proxy = LoadWord(LoadWord(view + 0x6B4) + uint32_t(i) * 4);
+                if (proxy && IsEffectProxy(LoadWord(proxy))) { NoteFlatCause("whole-screen effect"); v = viewCount; break; }
+            }
+        }
+    }
     if (viewCount < 2) { __imp__sub_823E2A08(ctx, base); return; }
     const PPCContext entry = ctx;
     bool started = false;
@@ -440,15 +511,6 @@ PPC_FUNC(sub_823E2A08)
                     LOG_NOTICE("vr: post group 4 view {} proxy vtable {:08x} flags {:08x} view+0x1D4 {}", v, key[1], key[2], int32_t(key[3]));
             }
             if (group == 4 && int32_t(LoadWord(view + 0x1D4)) > 0) StoreWord(proxy + 4, LoadWord(proxy + 4) & ~0x10000000u);
-            // The memory sequences' afterimage effect (proxy vtable 820036FC, Kaim's "recalls a memory"
-            // scenes): in stereo it draws the frame as tiled strips across both eyes. Not drawn in VR
-            // stereo; LO_VR_MEMORY_EFFECT=1 keeps it.
-            static const bool keepMemory = [] { const char* e = getenv("LO_VR_MEMORY_EFFECT"); return e && e[0] == '1'; }();
-            if (!keepMemory && !g_flatFrame && LoadWord(proxy) == 0x820036FCu) {
-                static bool logged = false;
-                if (!logged) { logged = true; LOG_NOTICE("vr: memory afterimage effect skipped in stereo"); }
-                continue;
-            }
             if (!clipped) {
                 // FViewInfo's integer render-target rectangle: +0x2C X, +0x30 Y, +0x34 SizeX, +0x38 SizeY.
                 static const bool originFix = [] { const char* e = getenv("LO_VR_POST_ORIGIN_FIX"); return !e || e[0] != '0'; }();
@@ -456,6 +518,12 @@ PPC_FUNC(sub_823E2A08)
                 const float x = LoadFloat(view + 0x1C), y = LoadFloat(view + 0x20);
                 EmitVrClip(x, y, x + LoadFloat(view + 0x24), y + LoadFloat(view + 0x28));
                 clipped = true;
+                g_inViewPost = true;
+                EmitViewMatrices(view);
+            }
+            {
+                const uint32_t words[gpu::vr_clip::PostProxyWordCount] = {gpu::vr_clip::Magic, LoadWord(proxy)};
+                gpu::frame_plan::EmitPrivatePacket(LoadWord(0x83302A38), gpu::vr_clip::PostProxyBegin, words);
             }
             PPCContext call = entry;
             call.r3.u32 = proxy; call.r4.u32 = LoadWord(sceneRenderer + 0x9C); call.r5.u32 = group;
@@ -464,6 +532,7 @@ PPC_FUNC(sub_823E2A08)
             ctx.r3 = call.r3;
         }
         g_postOffsetX = g_postOffsetY = 0;
+        g_inViewPost = false;
         if (clipped) EmitVrClip(0, 0, 0, 0);
     }
     if (started) {

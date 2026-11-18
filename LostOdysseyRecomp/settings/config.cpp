@@ -15,6 +15,24 @@ namespace
 {
 std::mutex mutex;
 std::atomic<uint32_t> menuAnimationRate{1};
+std::atomic<bool> runVrLimits{false}; // this run's VR mode limits the game's effects (set once on load)
+std::atomic<bool> runVrCulling{false}; // this run is in a VR mode (theater too): culling at most 100%
+// Same choice as vr::RequestedMode (xr/vr.cpp): LO_VR overrides the setting; VR runs on Vulkan only.
+// VR output in any mode (theater included when anyMode), on the Vulkan backend VR needs.
+bool VrModeOn(const Config &value, bool anyMode)
+{
+    bool headset = value.vrMode == 2 || value.vrMode == 3 || (anyMode && value.vrMode == 1);
+    if (const char *env = std::getenv("LO_VR"); env && *env) {
+        const std::string_view text(env);
+        headset = text == "mono" || text == "2" || text == "stereo" || text == "3" ||
+                  (anyMode && (text == "theater" || text == "1"));
+    }
+    if (!headset) return false;
+    const auto backend = gpu::backend::Requested(value.graphicsBackend, std::getenv("LO_GRAPHICS_API"));
+    return backend && *backend == gpu::backend::Backend::Vulkan;
+}
+bool VrModeLimits(const Config &value) { return VrModeOn(value, false); }
+bool VrCullingLimit(const Config &value) { return VrModeOn(value, true); }
 // One settings.ini line: no line breaks, bounded like the adapter/display names it stores.
 std::string TextValue(std::string text)
 {
@@ -145,6 +163,18 @@ Config Validate(Config value)
     // Metal always keeps display sync; the menu offers only ProMotion there.
     value.vsync = true;
 #endif
+    if (runVrLimits.load(std::memory_order_relaxed) || VrModeLimits(value)) {
+        value.depthOfFieldPercent = 0;
+        value.bloom = false;
+        value.motionBlur = false;
+        if (value.frameRate < 60) value.frameRate = 60;
+    }
+    // Culling above 100% shrinks objects' boxes toward their origin for the view test. In
+    // cinematic close-ups a character's origin (feet) is off screen, so whole characters or the
+    // arm reaching in vanish (hut sleep scene: only the bead shows). The headset's wide eye views
+    // hide it in stereo play, but the flat frames and theater use the game's own camera.
+    if (runVrCulling.load(std::memory_order_relaxed) || VrCullingLimit(value))
+        value.cullingPercent = std::min(value.cullingPercent, 100u);
     return value;
 }
 Config Read()
@@ -391,6 +421,12 @@ Config &Current()
 {
     static Config config = [] {
         auto value = Read();
+        runVrLimits.store(VrModeLimits(value), std::memory_order_relaxed);
+        runVrCulling.store(VrCullingLimit(value), std::memory_order_relaxed);
+        if (runVrCulling.load(std::memory_order_relaxed) && !runVrLimits.load(std::memory_order_relaxed))
+            LOG_NOTICE("settings: VR theater: culling {}%", value.cullingPercent);
+        if (runVrLimits.load(std::memory_order_relaxed))
+            LOG_NOTICE("settings: VR mono/stereo: depth of field, bloom and motion blur off, {} FPS, culling {}%", value.frameRate, value.cullingPercent);
         menuAnimationRate.store(value.menuAnimationRate, std::memory_order_relaxed);
         gpu::loading::SetMode(value.loadingTransitions);
         return value;
@@ -439,6 +475,14 @@ void ConfigureGameLanguages(const std::filesystem::path &xexPath)
     GameLanguageIds = europe ? std::span<const uint32_t>(EuropeLanguageIds) : std::span<const uint32_t>(AsiaLanguageIds);
     GameLanguageNames = europe ? std::span<const wchar_t *const>(EuropeLanguageNames) : std::span<const wchar_t *const>(AsiaLanguageNames);
     LOG_NOTICE("game edition: {}; {} game languages", europe ? "USA/Europe" : "Asia/default", GameLanguageIds.size());
+}
+bool VrLimitsGameEffects(const Config &config)
+{
+    return runVrLimits.load(std::memory_order_relaxed) || VrModeLimits(config);
+}
+bool VrLimitsCulling(const Config &config)
+{
+    return runVrCulling.load(std::memory_order_relaxed) || VrCullingLimit(config);
 }
 Config GetConfig()
 {

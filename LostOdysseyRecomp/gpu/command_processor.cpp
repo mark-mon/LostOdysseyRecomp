@@ -464,6 +464,33 @@ namespace gpu
             }
             return;
         }
+        if (index >= vr_clip::ViewMatricesBegin && index < vr_clip::ViewMatricesBegin + vr_clip::ViewMatricesWordCount)
+        {
+            static uint32_t words[vr_clip::ViewMatricesWordCount]{};
+            const uint32_t at = index - vr_clip::ViewMatricesBegin;
+            words[at] = value;
+            if (at == vr_clip::ViewMatricesWordCount - 1 && words[0] == vr_clip::Magic) {
+                float eye[16], game[16];
+                for (uint32_t i = 0; i < 16; ++i) { eye[i] = std::bit_cast<float>(words[1 + i]); game[i] = std::bit_cast<float>(words[17 + i]); }
+                renderer::SetVrViewMatrices(eye, game);
+                words[0] = 0;
+            }
+            return;
+        }
+        if (index == vr_clip::PostProxyBegin || index == vr_clip::PostProxyVtable)
+        {
+            static bool active = false;
+            if (index == vr_clip::PostProxyBegin) active = value == vr_clip::Magic;
+            else if (active) { renderer::SetVrPostProxy(value); active = false; }
+            return;
+        }
+        if (index == vr_clip::PostQuadBegin || index == vr_clip::PostQuadState)
+        {
+            static bool active = false;
+            if (index == vr_clip::PostQuadBegin) active = value == vr_clip::Magic;
+            else if (active) { renderer::SetVrPostQuad(value != 0); active = false; }
+            return;
+        }
         if (index == vr_clip::PoseBegin || index == vr_clip::PoseSerial)
         {
             static bool active = false;

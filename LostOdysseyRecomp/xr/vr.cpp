@@ -74,6 +74,7 @@ bool HudLayerActive() { return false; }
 bool HudCanvas(const plume::RenderViewport&, int32_t, int32_t, uint32_t, uint64_t, uint64_t) { return false; }
 void SetHudLayerSource(plume::RenderTexture*, uint32_t, uint32_t) {}
 uint32_t PoseSerialForView(uint32_t) { return 0; }
+bool GameViewProjectionForView(uint32_t, float*) { return false; }
 void SetFramePoseSerial(uint32_t) {}
 bool RenderSize(uint32_t, uint32_t&, uint32_t&) { return false; }
 bool RecommendedEyeSize(uint32_t&, uint32_t&) { return false; }
@@ -210,7 +211,8 @@ thread_local int t_eye = -1;
 
 // The pose each frame's views were built with, keyed by a hash of the view matrix the game
 // renders with (the FViewInfo the renderer works from copies the FSceneView's), under g_poseMutex.
-struct PoseRecord { uint64_t key = 0; uint32_t serial = 0; HeadPose pose; };
+// gameVP: the game's own view-projection of that view (before the headset's), row vectors.
+struct PoseRecord { uint64_t key = 0; uint32_t serial = 0; HeadPose pose; std::array<float, 16> gameVP{}; };
 std::array<PoseRecord, 64> g_poseRecords{};
 uint32_t g_poseRecordNext = 0, g_poseSerial = 0;
 std::atomic<uint32_t> g_framePoseSerial{0};  // GPU thread: the frame being processed
@@ -777,11 +779,18 @@ bool AdjustMainView(uint32_t view)
         if (!g_latest.valid) return false;
         head = g_latest;
     }
-    Mat4 viewMatrix{};
+    Mat4 viewMatrix{}, gameProjection{};
     for (uint32_t i = 0; i < 16; ++i) viewMatrix[i] = LoadGuestFloat(view + 0x40 + i * 4);
+    for (uint32_t i = 0; i < 16; ++i) gameProjection[i] = LoadGuestFloat(view + 0x80 + i * 4);
+    // The game's own view-projection, for the renderer's eye-cropped screen effects (gpu/vr_clip.h
+    // ViewMatricesBegin). LO_VR_EYE_CROP_ASPECT=flat uses the flat 16:9 screen's vertical scale instead
+    // of this eye view's (the game derives it from the view's aspect).
+    static const bool flatAspect = [] { const char* v = getenv("LO_VR_EYE_CROP_ASPECT"); return v && v[0] == 'f'; }();
+    Mat4 effectProjection = gameProjection;
+    if (flatAspect) effectProjection[5] = effectProjection[0] * (16.0f / 9.0f);
+    const Mat4 gameVP = Multiply(viewMatrix, effectProjection);
     if (g_adjustedViews == 0) {
-        Mat4 projection{};
-        for (uint32_t i = 0; i < 16; ++i) projection[i] = LoadGuestFloat(view + 0x80 + i * 4);
+        const Mat4& projection = gameProjection;
         LOG_NOTICE("vr: first main view V row3 [{:.1f} {:.1f} {:.1f} {:.3f}] P [{:.4f} {:.4f} | {:.4f} {:.4f} {:.4f} {:.4f} | {:.4f} {:.4f} {:.4f} {:.4f}]",
             viewMatrix[12], viewMatrix[13], viewMatrix[14], viewMatrix[15], projection[0], projection[5],
             projection[8], projection[9], projection[10], projection[11], projection[12], projection[13], projection[14], projection[15]);
@@ -804,7 +813,9 @@ bool AdjustMainView(uint32_t view)
         const std::scoped_lock lock(g_poseMutex);
         g_rendered = head;
         if (eye <= 0) ++g_poseSerial;
-        g_poseRecords[g_poseRecordNext++ % g_poseRecords.size()] = {key, g_poseSerial, head};
+        PoseRecord& record = g_poseRecords[g_poseRecordNext++ % g_poseRecords.size()];
+        record = {key, g_poseSerial, head};
+        std::copy(gameVP.begin(), gameVP.end(), record.gameVP.begin());
     }
     ++g_adjustedViews;
     return true;
@@ -818,6 +829,16 @@ uint32_t PoseSerialForView(uint32_t view)
     for (const PoseRecord& record : g_poseRecords)
         if (record.key == key) return record.serial;
     return 0;
+}
+
+bool GameViewProjectionForView(uint32_t view, float out[16])
+{
+    if (!s.running || !g_memory.base || !view) return false;
+    const uint64_t key = ViewKey(view);
+    const std::scoped_lock lock(g_poseMutex);
+    for (const PoseRecord& record : g_poseRecords)
+        if (record.key == key) { std::copy(record.gameVP.begin(), record.gameVP.end(), out); return true; }
+    return false;
 }
 
 void SetFramePoseSerial(uint32_t serial) { g_framePoseSerial.store(serial, std::memory_order_relaxed); }

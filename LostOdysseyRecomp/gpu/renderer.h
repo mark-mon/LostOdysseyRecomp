@@ -44,6 +44,13 @@ namespace gpu::renderer
     // Ordered host-private VR command (gpu/vr_clip.h): the guest rectangle that later draws and
     // resolve clears are confined to; right <= left turns it off.
     void SetVrClip(int32_t left, int32_t top, int32_t right, int32_t bottom);
+    // Ordered host-private VR command (gpu/vr_clip.h PostQuadBegin): the game's post-process
+    // quad helper is drawing (true) or done (false).
+    void SetVrPostQuad(bool drawing);
+    // gpu/vr_clip.h PostProxyBegin: the post-process proxy (vtable) now drawing in a view's clip.
+    void SetVrPostProxy(uint32_t vtable);
+    // gpu/vr_clip.h ViewMatricesBegin: this view's eye view-projection and the game's own.
+    void SetVrViewMatrices(const float eye[16], const float game[16]);
     // Ordered host-private movie command, consumed on the command processor
     // thread after the movie helper has drawn its safe-area destination.
     void ClearMovieBars(uint32_t surfaceInfo, uint32_t colorInfo,

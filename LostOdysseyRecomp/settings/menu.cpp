@@ -1205,6 +1205,10 @@ bool VrRowHidden(int r)
 // headset frame by the renderer.)
 bool VrGraphicsRowLocked(int r)
 {
+    // Off in VR mono/stereo (settings::VrLimitsGameEffects): they break the second eye.
+    if ((GraphicsRow(r) == GraphicsRow::DepthOfField || GraphicsRow(r) == GraphicsRow::Bloom ||
+         GraphicsRow(r) == GraphicsRow::MotionBlur) && settings::VrLimitsGameEffects(edit))
+        return true;
     const vr::Mode mode = vr::RequestedMode();
     if (mode != vr::Mode::Mono && mode != vr::Mode::Stereo) return false;
     switch (GraphicsRow(r)) {
@@ -1880,7 +1884,11 @@ void Publish(uint8_t *base, uint32_t config)
             : Tr(L"Select Matrix surround in Audio output to adjust this.",
                  L"在音訊輸出選擇矩陣環繞聲後才能調整。");
     if (tab == 2 && VrGraphicsRowLocked(row))
-        next.help = GraphicsRow(row) == GraphicsRow::RenderResolution
+        next.help = GraphicsRow(row) == GraphicsRow::DepthOfField || GraphicsRow(row) == GraphicsRow::Bloom ||
+                    GraphicsRow(row) == GraphicsRow::MotionBlur
+            ? Tr(L"Off in VR: this effect works on the whole screen and breaks the second eye's image.",
+                 L"VR 中關閉：此效果作用於整個畫面，會破壞第二隻眼睛的影像。")
+            : GraphicsRow(row) == GraphicsRow::RenderResolution
             ? Tr(L"Not used in VR: VR -> VR resolution sets the headset's render size.",
                  L"VR 中不使用：請在 VR -> VR 解析度設定頭戴裝置的渲染大小。")
             : Tr(L"Not used in VR: the headset shows the game's own image, so this only affects the desktop window (upscalers and frame generation are off).",
@@ -3933,7 +3941,9 @@ PPC_FUNC(sub_822F19B0)
                 edit.sceneFades = !edit.sceneFades;
                 break;
             case GraphicsRow::Culling:
-                edit.cullingPercent = uint32_t(std::clamp(int(std::min(edit.cullingPercent, 200u) + 5) / 10 * 10 + delta * 10, 0, 200));
+                // VR (theater too): at most 100% (settings::VrLimitsCulling).
+                edit.cullingPercent = uint32_t(std::clamp(int(std::min(edit.cullingPercent, 200u) + 5) / 10 * 10 + delta * 10, 0,
+                    settings::VrLimitsCulling(edit) ? 100 : 200));
                 break;
             case GraphicsRow::ScalingQuality:
 #if LO_PLATFORM_MACOS
@@ -3949,6 +3959,9 @@ PPC_FUNC(sub_822F19B0)
             {
                 const auto index = gpu::frame_rate::MenuIndex(edit.frameRate);
                 edit.frameRate = gpu::frame_rate::FromMenuIndex(cycle(index, gpu::frame_rate::kCount));
+                // 30 FPS judders in a headset: VR mono/stereo offers 60 and up.
+                if (edit.frameRate < 60 && settings::VrLimitsGameEffects(edit))
+                    edit.frameRate = gpu::frame_rate::FromMenuIndex(cycle(gpu::frame_rate::MenuIndex(edit.frameRate), gpu::frame_rate::kCount));
                 break;
             }
             case GraphicsRow::LoadingTransitions:
